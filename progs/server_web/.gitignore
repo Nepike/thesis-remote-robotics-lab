@@ -1,0 +1,14 @@
+/**/__pycache__
+/media/*
+/logs/*
+!/logs/readme.txt
+/**/migrations/*
+!/**/migrations/__init__.py
+/config.yml
+/db.sqlite3
+/static/*
+/.idea/*
+/.venv/*
+/.virtualenv/*
+/venv/*
+/virtualenv/*

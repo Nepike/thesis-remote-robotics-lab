@@ -1,0 +1,18 @@
+secret_key:
+deploy_secret:
+env:
+telegram_bot:
+  token: 
+  admin_chats:
+  - chat_id:
+    thread_msg:
+recaptcha:
+  public_key:
+  private_key:
+email:
+  host:
+  port:
+  user:
+  password:
+  use_ssl:
+  use_tls:
