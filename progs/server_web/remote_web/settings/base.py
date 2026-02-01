@@ -10,7 +10,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'core'
+    'core',
+    'channels'
 ]
 
 MIDDLEWARE = [
@@ -49,7 +50,15 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'remote_web.wsgi.application'
+# WSGI_APPLICATION = 'remote_web.wsgi.application'
+
+ASGI_APPLICATION = "remote_web.asgi.application"
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
+    }
+}
 
 DATABASES = {
     'default': {
@@ -68,3 +77,5 @@ MEDIA_ROOT = os.path.join(str(BASE_DIR), 'media/')
 MEDIA_URL = '/media/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+AUTH_USER_MODEL = 'core.CustomUser'
