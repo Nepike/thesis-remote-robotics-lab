@@ -1,0 +1,11 @@
+[
+  {
+    "ip": "10.142.169.5",
+    "port": 2000,
+    "type": "NOT_YET_IMPLEMENTED",
+    "name": "test mega yarp-13",
+    "namespace": "robot1/mega",
+    "shared": true,
+    "active": true
+  }
+]
