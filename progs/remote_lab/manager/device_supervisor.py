@@ -25,7 +25,7 @@ class DeviceProcess:
 
     @property
     def tty_path(self):
-        return f"/dev/ttyDEVICE-{self.device.name}"
+        return f"/tmp/remote_lab_tty/ttyDEVICE-{self.device.name}"
 
 
 class DeviceSupervisor:
@@ -52,7 +52,7 @@ class DeviceSupervisor:
             self.devices[device.name] = DeviceProcess(device)
             print(f"[DeviceSupervisor] Loaded {device.name}")
 
-    async def _start_device(self, device_proc: DeviceProcess):
+    async def __start_device(self, device_proc: DeviceProcess):
         device = device_proc.device
 
         # TODO: normal logging...
@@ -61,6 +61,7 @@ class DeviceSupervisor:
         if os.path.exists(device_proc.tty_path):
             os.remove(device_proc.tty_path)
 
+        # socat pty,link=/tmp/remote_lab_tty/ttyDEVICE-Test-yarp13,raw,echo=0,waitslave,mode=666,tcp:192.168.0.101:2000
         device_proc.socat_proc = await asyncio.create_subprocess_exec(
             "socat",
             f"pty,link={device_proc.tty_path},raw,echo=0,waitslave,mode=666",
@@ -82,7 +83,7 @@ class DeviceSupervisor:
         )
         await asyncio.sleep(1)  # God help us 2
 
-    async def _stop_device(self, device_proc: DeviceProcess):
+    async def __stop_device(self, device_proc: DeviceProcess):
         for proc in [device_proc.socat_proc, device_proc.rosserial_proc]:
             if proc and proc.returncode is None:
                 proc.terminate()
@@ -94,34 +95,34 @@ class DeviceSupervisor:
         device = device_proc.device
         print(f"[DeviceSupervisor] Stopped {device.name}")
 
-    async def _restart_device(self, device_proc: DeviceProcess):
-        await self._stop_device(device_proc)
+    async def __restart_device(self, device_proc: DeviceProcess):
+        await self.__stop_device(device_proc)
         await asyncio.sleep(1)
-        await self._start_device(device_proc)
+        await self.__start_device(device_proc)
 
-    async def _watchdog_loop(self):
+    async def __watchdog_loop(self):
         while self.running:
             for device_proc in self.devices.values():
                 # socat
                 if device_proc.socat_proc and device_proc.socat_proc.returncode is not None:
                     print(f"[DeviceSupervisor] socat died for {device_proc.device.name}, restarting...")
-                    await self._restart_device(device_proc)
+                    await self.__restart_device(device_proc)
                 # rosserial
                 if device_proc.rosserial_proc and device_proc.rosserial_proc.returncode is not None:
                     print(f"[DeviceSupervisor] rosserial died for {device_proc.device.name}, restarting...")
-                    await self._restart_device(device_proc)
+                    await self.__restart_device(device_proc)
 
             await asyncio.sleep(10)
 
     async def start_all(self):
         self.running = True
         for device_proc in self.devices.values():
-            await self._start_device(device_proc)
-        asyncio.create_task(self._watchdog_loop())
+            await self.__start_device(device_proc)
+        asyncio.create_task(self.__watchdog_loop())
 
     async def stop_all(self):
         print("[DeviceSupervisor] Shutting down ...")
         self.running = False
 
         for device_proc in self.devices.values():
-            await self._stop_device(device_proc)
+            await self.__stop_device(device_proc)

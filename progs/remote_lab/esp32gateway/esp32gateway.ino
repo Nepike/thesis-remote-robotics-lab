@@ -2,9 +2,12 @@
 #include <WiFiClient.h>
 #include <WiFiServer.h>
 
+// ===== НАСТРОЙКИ LED =====
+#define LED_PIN 2   // Обычно встроенный LED на GPIO2
+
 // Настройки Wi-Fi
-const char* ssid = "Nopike";
-const char* password = "11111111";
+const char* ssid = "Nepike";
+const char* password = "123453119670";
 
 // Настройки сервера
 WiFiServer server(2000);
@@ -15,17 +18,31 @@ HardwareSerial arduinoSerial(2); // UART2 на пинах 16(RX), 17(TX)
 
 void setup() {
   Serial.begin(115200);
-  arduinoSerial.begin(57600); // Скорость должна совпадать с rosserial
+  arduinoSerial.begin(57600);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW); // LED выключен
 
   // Подключение к Wi-Fi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
+
+  bool ledState = false;
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    
+    // МИГАНИЕ LED
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
   }
+
+  // Wi-Fi подключен
   Serial.println("\nConnected! IP address: ");
   Serial.println(WiFi.localIP());
+
+  digitalWrite(LED_PIN, HIGH); // LED горит постоянно
 
   // Запуск TCP-сервера
   server.begin();
@@ -57,6 +74,5 @@ void loop() {
     }
   }
 
-  // Небольшая задержка для стабильности
   delay(1);
 }
