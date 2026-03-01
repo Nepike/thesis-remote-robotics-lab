@@ -77,7 +77,7 @@ class DeviceSupervisor:
             f"source {Path.home()}/ros/devel/setup.bash && "
             f"roslaunch yyctl rosserial.launch "
             f"port:={device_proc.tty_path} "
-            f"__ns:={device_proc.namespace}"
+            f"__ns:={device.namespace}"
         )
         device_proc.rosserial_proc = await asyncio.create_subprocess_shell(
             cmd,
