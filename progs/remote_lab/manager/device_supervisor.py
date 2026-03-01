@@ -61,7 +61,7 @@ class DeviceSupervisor:
         if os.path.exists(device_proc.tty_path):
             os.remove(device_proc.tty_path)
 
-        # socat pty,link=/tmp/remote_lab_tty/ttyDEVICE-Test-yarp13,raw,echo=0,waitslave,mode=666,tcp:192.168.0.101:2000
+        # socat pty,link=/tmp/remote_lab_tty/ttyDEVICE-Test-yarp13,raw,echo=0,waitslave,mode=666 tcp:192.168.0.101:2000
         device_proc.socat_proc = await asyncio.create_subprocess_exec(
             "socat",
             f"pty,link={device_proc.tty_path},raw,echo=0,waitslave,mode=666",
@@ -73,9 +73,9 @@ class DeviceSupervisor:
 
         # roslaunch yyctl rosserial.launch port:=/dev/ttyESP32
         device_proc.rosserial_proc = await asyncio.create_subprocess_exec(
-            "roslaunch",
-            "yyctl",
-            "rosserial.launch",
+            f"source /opt/ros/noetic/setup.bash && "
+            f"source {Path.home()}/ros/devel/setup.bash && "
+            f"roslaunch yyctl rosserial.launch",
             f"port:={device_proc.tty_path}",
             f"__ns:={device.namespace}",
             stdout=asyncio.subprocess.DEVNULL,

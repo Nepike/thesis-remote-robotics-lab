@@ -1,78 +1,64 @@
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <WiFiServer.h>
 
-// ===== НАСТРОЙКИ LED =====
-#define LED_PIN 2   // Обычно встроенный LED на GPIO2
+#define LED_PIN 2
 
-// Настройки Wi-Fi
 const char* ssid = "Nepike";
 const char* password = "123453119670";
 
-// Настройки сервера
 WiFiServer server(2000);
 WiFiClient client;
 
-// Настройки UART
-HardwareSerial arduinoSerial(2); // UART2 на пинах 16(RX), 17(TX)
+#define RXD2 16
+#define TXD2 17
 
 void setup() {
+
   Serial.begin(115200);
-  arduinoSerial.begin(57600);
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // LED выключен
+  digitalWrite(LED_PIN, LOW);
+  bool ledState = false;
 
-  // Подключение к Wi-Fi
+  WiFi.setSleep(false);
+
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
-
-  bool ledState = false;
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    
-    // МИГАНИЕ LED
+
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState);
   }
 
-  // Wi-Fi подключен
-  Serial.println("\nConnected! IP address: ");
+  Serial.println("\nConnected!");
+  Serial.print("ESP32 IP: ");
   Serial.println(WiFi.localIP());
+  digitalWrite(LED_PIN, HIGH);
 
-  digitalWrite(LED_PIN, HIGH); // LED горит постоянно
-
-  // Запуск TCP-сервера
   server.begin();
-  Serial.println("TCP server started on port 2000");
+
+  Serial2.begin(57600, SERIAL_8N1, RXD2, TXD2);
 }
 
 void loop() {
-  // Проверка подключения клиента
+
+  // ожидание клиента
   if (!client || !client.connected()) {
     client = server.available();
-    if (client) {
-      Serial.println("New client connected");
-    }
+    return;
   }
 
-  // Получение данных от TCP-клиента и отправка в UART
-  if (client && client.connected()) {
-    while (client.available()) {
-      uint8_t byte = client.read();
-      arduinoSerial.write(byte);
-    }
+  // TCP → Mega
+  while (client.available()) {
+    uint8_t c = client.read();
+    Serial2.write(c);
   }
 
-  // Получение данных от UART и отправка TCP-клиенту
-  while (arduinoSerial.available()) {
-    uint8_t byte = arduinoSerial.read();
-    if (client && client.connected()) {
-      client.write(byte);
-    }
+  // Mega → TCP
+  while (Serial2.available()) {
+    uint8_t c = Serial2.read();
+    client.write(c);
   }
-
-  delay(1);
 }
