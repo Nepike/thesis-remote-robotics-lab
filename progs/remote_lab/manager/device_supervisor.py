@@ -81,11 +81,10 @@ class DeviceSupervisor:
 
         # roslaunch yyctl rosserial.launch port:=/dev/ttyESP32
         cmd = (
-            f"source /opt/ros/noetic/setup.bash && "
+            f"bash -c 'source /opt/ros/noetic/setup.bash && "
             f"source {Path.home()}/ros/devel/setup.bash && "
             f"roslaunch yyctl rosserial.launch "
-            f"port:={device_proc.tty_path} "
-            f"__ns:={device.namespace}"
+            f"port:={device_proc.tty_path} __ns:={device_proc.device.namespace}'"
         )
         device_proc.rosserial_proc = await asyncio.create_subprocess_shell(
             cmd,
