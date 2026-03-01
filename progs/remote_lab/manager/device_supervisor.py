@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Dict, Optional
 from pathlib import Path
 import json
@@ -69,7 +70,14 @@ class DeviceSupervisor:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL
         )
-        await asyncio.sleep(1) # God help us
+        #await asyncio.sleep(1) # God help us
+
+        timeout = 5  # секунд
+        start = time.time()
+        while not os.path.exists(device_proc.tty_path):
+            await asyncio.sleep(0.1)
+            if time.time() - start > timeout:
+                raise RuntimeError(f"TTY {device_proc.tty_path} not ready after 5s")
 
         # roslaunch yyctl rosserial.launch port:=/dev/ttyESP32
         cmd = (
