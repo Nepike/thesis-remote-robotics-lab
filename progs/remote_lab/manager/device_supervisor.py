@@ -72,12 +72,12 @@ class DeviceSupervisor:
         )
         #await asyncio.sleep(1) # God help us
 
-        timeout = 5  # секунд
-        start = time.time()
-        while not os.path.exists(device_proc.tty_path):
-            await asyncio.sleep(0.1)
-            if time.time() - start > timeout:
-                raise RuntimeError(f"TTY {device_proc.tty_path} not ready after 5s")
+        # timeout = 5  # секунд
+        # start = time.time()
+        # while not os.path.exists(device_proc.tty_path):
+        #     await asyncio.sleep(0.1)
+        #     if time.time() - start > timeout:
+        #         raise RuntimeError(f"TTY {device_proc.tty_path} not ready after 5s")
 
         # roslaunch yyctl rosserial.launch port:=/dev/ttyESP32
         cmd = (
@@ -89,7 +89,7 @@ class DeviceSupervisor:
         )
         device_proc.rosserial_proc = await asyncio.create_subprocess_shell(
             cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=open(f"/tmp/{device_proc.device.name}.log", "w"),
             stderr=asyncio.subprocess.DEVNULL
         )
         await asyncio.sleep(1)  # God help us 2
