@@ -90,7 +90,7 @@ class DeviceSupervisor:
         device_proc.rosserial_proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=open(f"/tmp/{device_proc.device.name}.log", "w"),
-            stderr=asyncio.subprocess.DEVNULL
+            stderr=open(f"/tmp/{device_proc.device.name}.errlog", "w")
         )
         await asyncio.sleep(1)  # God help us 2
 
