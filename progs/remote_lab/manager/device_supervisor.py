@@ -19,7 +19,6 @@ class Device:
 
 
 class DeviceProcess:
-
     def __init__(self, device: Device, tty_root: Path):
         self.device = device
         self.tty_root = tty_root
