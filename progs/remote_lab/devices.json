@@ -1,11 +1,15 @@
 [
   {
+    "name": "Test-device",
     "ip": "192.168.0.101",
     "port": 2000,
-    "type": "NOT_YET_IMPLEMENTED",
-    "name": "Test-yarp13",
-    "namespace": "robot1/mega",
+    "type": "yarp13",
+    "protocol": "ros",
+    "config": {
+      "namespace": "robot1/test-deivce"
+    },
     "shared": true,
     "active": true
   }
 ]
+
