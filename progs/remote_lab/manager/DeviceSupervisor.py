@@ -54,7 +54,7 @@ class DeviceInstance:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
-            await asyncio.sleep(1)  # God help us 2
+            await asyncio.sleep(1)  # God help us
         elif self.device.protocol == "serial":
             pass
         else:
@@ -134,6 +134,7 @@ class DeviceSupervisor:
         self.running = True
         for device_instance in self._devices:
             await device_instance.start()
+            print(f"[DeviceSupervisor] Starting {device_instance.device.name}...")
         asyncio.create_task(self._watchdog_loop())
 
 
