@@ -7,7 +7,12 @@ import os
 
 from BasicClasses import Device
 
-
+async def _log_stream(prefix, stream):
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        print(f"{prefix}: {line.decode().rstrip()}")
 
 class DeviceInstance:
     """
@@ -32,14 +37,18 @@ class DeviceInstance:
             "socat",
             f"pty,link={self.device.tty_path},raw,echo=0,waitslave,mode=666",
             f"tcp:{self.device.ip}:{self.device.port}",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL # TODO: logging !!!
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+
+        asyncio.create_task(_log_stream("SOCAT", self.transport_proc.stderr))
 
         for _ in range(20):
             if os.path.exists(self.device.tty_path):
                 break
             await asyncio.sleep(0.1)
+
+        print(f"[Device] started transport for {self.device.name}")
 
     async def _start_adapter_proc(self):
         if self.device.protocol == "ros":
@@ -51,14 +60,18 @@ class DeviceInstance:
             )
             self.adapter_proc = await asyncio.create_subprocess_shell(
                 cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
             await asyncio.sleep(1)  # God help us
+            asyncio.create_task(_log_stream("ROS", self.adapter_proc.stderr))
+
         elif self.device.protocol == "serial":
             pass
         else:
             raise NotImplementedError
+
+        print(f"[Device] started adapter for {self.device.name}")
 
 
     async def start(self):
@@ -120,10 +133,12 @@ class DeviceSupervisor:
             for device_instance in self._devices:
 
                 if device_instance.transport_proc and device_instance.transport_proc.returncode is not None:
+                    print(f"[DeviceSupervisor] transport is dead for {device_instance.device.name}, restarting...")
                     asyncio.create_task(device_instance.restart())
                     continue
 
                 if device_instance.adapter_proc and device_instance.adapter_proc.returncode is not None:
+                    print(f"[DeviceSupervisor] adapter is dead for {device_instance.device.name}, restarting...")
                     asyncio.create_task(device_instance.restart())
                     continue
 
@@ -133,8 +148,8 @@ class DeviceSupervisor:
     async def run(self):
         self.running = True
         for device_instance in self._devices:
-            await device_instance.start()
             print(f"[DeviceSupervisor] Starting {device_instance.device.name}...")
+            await device_instance.start()
         asyncio.create_task(self._watchdog_loop())
 
 

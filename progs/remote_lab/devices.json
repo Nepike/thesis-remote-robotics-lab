@@ -1,7 +1,7 @@
 [
   {
     "name": "Test-device",
-    "ip": "192.168.0.101",
+    "ip": "192.168.0.102",
     "port": 2000,
     "type": "yarp13",
     "protocol": "ros",

@@ -6,7 +6,7 @@ from DeviceSupervisor import DeviceSupervisor
 
 class RemoteLabManager:
     def __init__(self):
-        self.device_supervisor = DeviceSupervisor(config_path="devices.json")
+        self.device_supervisor = DeviceSupervisor(config_path="../devices.json")
 
     async def start(self):
         self.device_supervisor.load_devices()
