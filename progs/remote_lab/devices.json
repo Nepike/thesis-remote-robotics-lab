@@ -3,11 +3,8 @@
     "name": "Test-device",
     "ip": "192.168.0.102",
     "port": 2000,
-    "type": "yarp13",
-    "protocol": "ros",
-    "config": {
-      "namespace": "robot1/test-deivce"
-    },
+    "driver": "yarp13",
+    "ros_namespace": "robot1/test-deivce",
     "shared": true,
     "active": true
   }
