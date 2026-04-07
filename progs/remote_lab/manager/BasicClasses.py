@@ -20,7 +20,6 @@ class Device:
     baud_rate: Optional[int] # for serial-based drivers
     # ... for <smth>-based drivers
 
-
     @property
     def tty_path(self) -> str:
         return str(Path(DEVICES_TTY_ROOT) / f"ttyDEVICE-{self.name}")
