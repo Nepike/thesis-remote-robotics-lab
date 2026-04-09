@@ -1,33 +1,11 @@
 import asyncio
-import time
+
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Awaitable
 
 
-@dataclass(order=True)
-class Command:
-    """
-    Command object stored in device priority queues.
 
-    Ordering is based on (priority, timestamp) so PriorityQueue
-    executes higher priority commands first and keeps FIFO
-    ordering for equal priorities.
-    """
-
-    priority: int
-    timestamp: float = field(init=False, compare=True)
-
-    command_id: str = field(default_factory=lambda: str(uuid.uuid4()), compare=False)
-    client_id: str = field(default="", compare=False)
-
-    devices: List[str] = field(default_factory=list, compare=False)
-
-    name: str = field(default="", compare=False)
-    args: dict = field(default_factory=dict, compare=False)
-
-    def __post_init__(self):
-        self.timestamp = time.time()
 
 
 class CommandScheduler:

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from BasicClasses import Device, Command
 from HardwareInterfaces import RosInterface, SerialInterface
+from Logger import Logger
+
 
 class AbstractDriver(ABC):
     """
@@ -57,16 +59,19 @@ class RosBasedDriver(AbstractDriver):
             f"port:={self._device.tty_path} __ns:={self._device.ros_namespace}'"
         )
 
-        adapters = [await asyncio.create_subprocess_shell(
+        proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
-        )]
+        )
         await asyncio.sleep(1)  # God help us
 
-        # TODO logging
+        logger = Logger.get()
+        await logger.log("DRIVER",  f"roslaunch for {self._device.name} started")
+        logger.attach_stream("DRIVER", proc.stdout)
+        logger.attach_stream("DRIVER_ERR", proc.stderr)
 
-        return tuple(adapters)
+        return tuple([proc])
 
     @abstractmethod
     async def execute_command(self, command: Command):
@@ -134,7 +139,7 @@ class DriverFactory:
         self._ros: RosInterface = ros
         self._serial: SerialInterface = serial
 
-    def create(self, device: Device) -> AbstractDriver:
+    def create_driver(self, device: Device) -> AbstractDriver:
         if device.driver == "yarp13":
             return Yarp13Driver(device, self._ros)
         elif ...:

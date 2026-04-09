@@ -67,3 +67,9 @@ class RosInterface:
 
             self._subscribers.clear()
             self._publishers.clear()
+
+
+
+# TODO
+class SerialInterface:
+    ...
