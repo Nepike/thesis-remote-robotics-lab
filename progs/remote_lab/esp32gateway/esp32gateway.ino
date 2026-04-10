@@ -10,13 +10,16 @@ WiFiClient client;
 #define TXD2 17
 #define LED_PIN 2
 
+// Буфер для пакетной отправки в TCP
+#define TCP_BUF_SIZE 64
+uint8_t tcpBuffer[TCP_BUF_SIZE];
+uint8_t tcpBufPos = 0;
+
 void setup() {
   Serial.begin(115200);
-
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  bool ledState = false;
-
+  
   WiFi.setSleep(false);
   WiFi.begin(ssid, password);
 
@@ -24,9 +27,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState);
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
   }
 
   Serial.println("\nConnected!");
@@ -35,21 +36,22 @@ void setup() {
   digitalWrite(LED_PIN, HIGH);
 
   server.begin();
-  Serial2.begin(57600, SERIAL_8N1, RXD2, TXD2);
+  Serial2.begin(57600, SERIAL_8N1, RXD2, TXD2); // скорость под девайс!
 }
 
 void loop() {
-
   if (!client || !client.connected()) {
-    client = server.available();
-
-    if (client) {
+    WiFiClient newClient = server.available();
+    if (newClient) {
+      client = newClient;
+      client.setNoDelay(true);
       Serial.println("Client connected");
-      // clear buffers
+      
       while (Serial2.available()) Serial2.read();
       while (client.available()) client.read();
+      tcpBufPos = 0;
     }
-    delay(1);
+    yield();
     return;
   }
 
@@ -60,15 +62,28 @@ void loop() {
 
   // UART → TCP
   while (Serial2.available()) {
-    if (!client.connected()) {
-      break;
-    }
-
+    if (!client.connected()) break;
+    
     uint8_t c = Serial2.read();
-    if (client.write(c) != 1) {
-      break;
+    tcpBuffer[tcpBufPos++] = c;
+    
+    if (tcpBufPos >= TCP_BUF_SIZE) {
+      flushTcpBuffer();
     }
   }
+  
+  if (tcpBufPos > 0 && !client.available() && !Serial2.available()) {
+    flushTcpBuffer();
+  }
 
-  delay(1); // very VERY important
+  yield();
+}
+
+
+void flushTcpBuffer() {
+  if (tcpBufPos > 0 && client.connected()) {
+    client.write(tcpBuffer, tcpBufPos);
+    client.flush();  // гарантируем отправку
+    tcpBufPos = 0;
+  }
 }
