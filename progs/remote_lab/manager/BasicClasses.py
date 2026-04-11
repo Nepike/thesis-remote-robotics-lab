@@ -5,8 +5,6 @@ from typing import Optional, List, Dict
 import time
 
 
-
-
 @dataclass(frozen=True)
 class Device:
     name: str

@@ -207,6 +207,9 @@ class Yarp13Driver(RosBasedDriver):
 
 
 class DriverFactory:
+    """
+    Factory for creating drivers.
+    """
     def __init__(self, ros: RosInterface, serial: SerialInterface):
         self._ros: RosInterface = ros
         self._serial: SerialInterface = serial

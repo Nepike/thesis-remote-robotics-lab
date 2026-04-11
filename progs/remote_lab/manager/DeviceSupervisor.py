@@ -2,7 +2,7 @@ import asyncio
 import time
 from typing import List, Optional, Dict, Callable
 from pathlib import Path
-import json
+
 import os
 
 from BasicClasses import Device
