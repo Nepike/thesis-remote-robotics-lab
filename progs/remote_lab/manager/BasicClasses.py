@@ -4,8 +4,7 @@ import uuid
 from typing import Optional, List, Dict
 import time
 
-DEVICES_TTY_ROOT = "/tmp/remote_lab_tty"
-Path(DEVICES_TTY_ROOT).mkdir(parents=True, exist_ok=True)
+
 
 
 @dataclass(frozen=True)
@@ -20,10 +19,6 @@ class Device:
     ros_namespace: Optional[str] # for ros-based drivers
     baud_rate: Optional[int] # for serial-based drivers
     # ... for <smth>-based drivers
-
-    @property
-    def tty_path(self) -> str:
-        return str(Path(DEVICES_TTY_ROOT) / f"ttyDEVICE-{self.name}")
 
 
 class User:

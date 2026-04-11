@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Callable
 from pathlib import Path
 import json
 import os
@@ -8,7 +8,7 @@ import os
 from BasicClasses import Device
 from Logger import Logger
 
-
+#
 # class DeviceInstance:
 #     """
 #     Bonds the device and required processes.
@@ -24,49 +24,7 @@ from Logger import Logger
 #
 #         self._restart_lock = asyncio.Lock()
 #
-#     async def _start_transport_proc(self):
-#         if os.path.exists(self.device.tty_path):
-#             os.remove(self.device.tty_path)
 #
-#         self.transport_proc = await asyncio.create_subprocess_exec(
-#             "socat",
-#             f"pty,link={self.device.tty_path},raw,echo=0,waitslave,mode=666",
-#             f"tcp:{self.device.ip}:{self.device.port}",
-#             stdout=asyncio.subprocess.PIPE,
-#             stderr=asyncio.subprocess.PIPE
-#         )
-#
-#         asyncio.create_task(_log_stream("SOCAT", self.transport_proc.stderr))
-#
-#         for _ in range(20):
-#             if os.path.exists(self.device.tty_path):
-#                 break
-#             await asyncio.sleep(0.1)
-#
-#         print(f"[Device] started transport for {self.device.name}")
-#
-#     async def _start_adapter_proc(self):
-#         if self.device.protocol == "ros":
-#             cmd = (
-#                 f"bash -c 'source /opt/ros/noetic/setup.bash && "
-#                 f"source {Path.home()}/ros/devel/setup.bash && "
-#                 f"roslaunch yyctl rosserial.launch "
-#                 f"port:={self.device.tty_path} __ns:={self.device.config.get('namespace')}'"
-#             )
-#             self.adapter_proc = await asyncio.create_subprocess_shell(
-#                 cmd,
-#                 stdout=asyncio.subprocess.PIPE,
-#                 stderr=asyncio.subprocess.PIPE
-#             )
-#             await asyncio.sleep(1)  # God help us
-#             asyncio.create_task(_log_stream("ROS", self.adapter_proc.stderr))
-#
-#         elif self.device.protocol == "serial":
-#             pass
-#         else:
-#             raise NotImplementedError
-#
-#         print(f"[Device] started adapter for {self.device.name}")
 #
 #
 #     async def start(self):
@@ -100,7 +58,8 @@ class DeviceSupervisor:
         """
         def __init__(self, name: str, process: asyncio.subprocess.Process):
             self.name = name
-            self.process = process
+
+
 
 
     def __init__(self):
