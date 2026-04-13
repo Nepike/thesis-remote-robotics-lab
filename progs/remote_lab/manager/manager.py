@@ -1,22 +1,20 @@
 import asyncio
 from pathlib import Path
 import json
+from typing import Dict
 
 from BasicClasses import Device
 from HardwareInterfaces import RosInterface, SerialInterface
-from DeviceDrivers import DriverFactory
+from DeviceDrivers import DriverFactory, AbstractDriver
 from DeviceSupervisor import DeviceSupervisor
 
 
 
 class RemoteLabManager:
     def __init__(self):
-        self.ros_interface = RosInterface()
-        self.serial_interface = SerialInterface()
-
-        self.driver_factory: DriverFactory = DriverFactory(self.ros_interface, self.serial_interface)
-
+        self.driver_factory: DriverFactory = DriverFactory(RosInterface(), SerialInterface())
         self.device_supervisor = DeviceSupervisor()
+        self.drivers: Dict[Device, AbstractDriver] = {}
 
     async def load_config(self, config_path:Path = Path("./devices.json")):
         with open(config_path, "r") as f:
@@ -38,7 +36,7 @@ class RemoteLabManager:
                 if not device.active:
                     continue
 
-                # TODO
+                self.drivers[device] = self.driver_factory.create_driver(device)
 
         except KeyError as e:
             raise ValueError(f"Config file doesn't fit required structure (some fields are missing): {e})")

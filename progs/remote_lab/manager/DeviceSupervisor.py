@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import List, Optional, Dict, Callable
+from typing import List, Optional, Dict, Callable, Tuple, Awaitable
 from pathlib import Path
 
 import os
@@ -52,50 +52,36 @@ class DeviceSupervisor:
     """
     Provides methods for monitoring devices' processes
     """
-    class _DeviceProcess:
+
+    # TODO make iterable make strict typization add override for driver overrides
+    class _DeviceProcesses:
         """
-        Just an auxiliary class for storing additional processes info
+        An auxiliary class for storing processes
         """
-        def __init__(self, name: str, process: asyncio.subprocess.Process):
-            self.name = name
+        def __init__(self,
+                     transport_starter: Callable[[], Awaitable[Tuple[asyncio.subprocess.Process, ...]]],
+                     adapter_starter: Callable[[], Awaitable[Tuple[asyncio.subprocess.Process, ...]]]):
+            self._transport_starter = transport_starter
+            self._adapter_starter = adapter_starter
+            self.processes: List[asyncio.subprocess.Process] = []
 
+        async def start(self):
+            transport_procs = await self._transport_starter()
+            adapter_procs = await self._adapter_starter()
 
-
+            self.processes.extend(transport_procs + adapter_procs)
 
     def __init__(self):
-        self._procs: Dict[Device, List[DeviceSupervisor._DeviceProcess]] = {}
+        self._procs: Dict[Device, List[asyncio.subprocess.Process]] = {}
         self._running = False
 
 
-    def load_device(self, device: Device):
-        self._procs[device] = list()
+    def load_device(self, device: Device, transport_starter: Callable[[], Tuple[asyncio.subprocess.Process, ...]],
+                    adapter_starter: Callable[[], Tuple[asyncio.subprocess.Process, ...]]):
+        self._processes[device] = list()
+        self._starters[device] = DeviceSupervisor._DeviceStarters(transport_starter, adapter_starter)
         logger = Logger.get()
         logger.log("DEVICE_SUPERVISOR", f"Device '{device.name}' loaded")
-
-
-    def load_from_config(self, config_path: Path):
-        with open(config_path, "r") as f:
-            raw = json.load(f)
-
-        try:
-            for item in raw:
-                device = Device(
-                    name=item["name"],
-                    ip=item["ip"],
-                    port=item["port"],
-                    driver=item["driver"],
-                    ros_namespace=item.get("ros_namespace", None),
-                    baud_rate=item.get("baud_rate", None),
-                    shared=item["shared"],
-                    active=item["active"],
-                )
-
-                if not device.active:
-                    continue
-                self.load_device(device)
-
-        except KeyError as e:
-            raise ValueError(f"Config file doesn't fit required structure (some fields are missing): {e})")
 
 
     async def _watchdog_loop(self):
