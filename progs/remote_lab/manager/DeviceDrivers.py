@@ -1,12 +1,16 @@
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 import asyncio
 from pathlib import Path
 import os
 
+# Available once the package has been built via catkin and the ROS environment has been loaded (source devel/setup.bash).
+import msg_yy.msg
+
 from BasicClasses import Device, Command
 from HardwareInterfaces import RosInterface, SerialInterface
 from Logger import Logger
+from TelemetryTypes import Yarp13Telemetry, SimpleSerialTelemetry
 
 
 class AbstractDriver(ABC):
@@ -22,6 +26,15 @@ class AbstractDriver(ABC):
         transport_root = Path("/tmp/remote_lab_tty")
         transport_root.mkdir(parents=True, exist_ok=True)
         self._transport_path: Path = transport_root / f"ttyDEVICE-{self._device.name}"
+
+        # For pull-telemetry
+        self._latest_telemetry: Optional[Any] = None
+
+        #  When a new message arrives from the device, all the functions are called.
+        self._telemetry_listeners: Dict[int, Callable[[Any], Awaitable[None]]] = {}
+
+        # Counter for generating unique listener IDs
+        self._next_listener_id: int = 0
 
     @abstractmethod
     async def start_transports(self) -> Tuple[asyncio.subprocess.Process, ...]:
@@ -46,10 +59,32 @@ class AbstractDriver(ABC):
         """
         pass
 
+    async def setup_telemetry(self):
+        """Subscribe to device telemetry sources. Called after adapters are started."""
+        pass
 
-    # TODO telemetry
-    # def register_telemetry(...):
-    #     pass
+    async def teardown_telemetry(self):
+        """Unsubscribe / close telemetry connections. Called before processes are stopped."""
+        pass
+
+    def get_telemetry(self) -> Optional[Any]:
+        """Return the latest received telemetry snapshot, or None if nothing has arrived yet."""
+        return self._latest_telemetry
+
+    def add_telemetry_listener(self, callback: Callable[[Any], Awaitable[None]]) -> int:
+        """Register an async callback invoked on every new telemetry message. Returns listener id."""
+        lid = self._next_listener_id
+        self._telemetry_listeners[lid] = callback
+        self._next_listener_id += 1
+        return lid
+
+    def remove_telemetry_listener(self, listener_id: int):
+        self._telemetry_listeners.pop(listener_id, None)
+
+    async def _notify_listeners(self, telemetry: Any):
+        # It iterates over a copy of the dictionary because the listener could theoretically remove itself during the call
+        for callback in list(self._telemetry_listeners.values()):
+            await callback(telemetry)
 
 
 # ---------------------------- STARTERS POOL GO HERE ----------------------------
@@ -198,9 +233,83 @@ class Yarp13Driver(RosBasedDriver):
     - beep
     - ...
     """
+
+    async def setup_telemetry(self):
+        self._ros.subscribe_async(
+            f"/{self._device.ros_namespace}/yy_sensors",
+            msg_yy.msg.sens,
+            self._on_sensors_msg,
+        )
+
+    async def _on_sensors_msg(self, msg):
+        telemetry = Yarp13Telemetry(
+            enc_left=msg.enc_left,
+            enc_right=msg.enc_right,
+            speed_left=int(msg.data[2]),
+            speed_right=int(msg.data[3]),
+            compass=msg.compass,
+            pitch=msg.cpitch,
+            roll=msg.croll,
+            acc_voltage=msg.acc_voltage,
+            rf_center=msg.rf_center,
+            rf_left=msg.rf_left,
+            rf_right=msg.rf_right,
+            rf_side_left_fwd=msg.rf_side_left_fwd,
+            rf_side_right_fwd=msg.rf_side_right_fwd,
+            rf_side_left_bck=msg.rf_side_left_bck,
+            rf_side_right_bck=msg.rf_side_right_bck,
+            rf_bck_center=msg.rf_bck_center,
+            pwm_left=float(msg.data[4]),
+            pwm_right=float(msg.data[5]),
+            bumpers=int(msg.data[1]),
+            status=msg.status,
+            cmd_count=int(msg.data[0]),
+        )
+        self._latest_telemetry = telemetry
+        await self._notify_listeners(telemetry)
+
     async def execute_command(self, command: Command):
         # TODO
         pass
+
+
+class SimpleSerialDevice(SerialBasedDriver):
+    """
+    Example driver for a minimal custom serial device.
+
+    Protocol (newline-terminated ASCII):
+      Telemetry from device: "uptime=<int>,value=<float>,status=<str>"
+      Commands to device:    "<name> [arg1 arg2 ...]\n"
+
+    Example commands:  "ON\n",  "OFF\n",  "SET_THRESHOLD 50\n"
+    """
+
+    async def setup_telemetry(self):
+        await self._serial.open(self._transport_path, self._device.baud_rate)
+        self._serial.subscribe_async(self._transport_path, self._on_line)
+
+    async def teardown_telemetry(self):
+        await self._serial.close(self._transport_path)
+
+    async def _on_line(self, line: bytes):
+        try:
+            parts = dict(kv.split("=") for kv in line.decode().strip().split(","))
+            telemetry = SimpleSerialTelemetry(
+                uptime=int(parts["uptime"]),
+                value=float(parts["value"]),
+                status=parts["status"],
+            )
+        except Exception:
+            return  # malformed line — silently skip
+
+        self._latest_telemetry = telemetry
+        await self._notify_listeners(telemetry)
+
+    async def execute_command(self, command: Command):
+        line = command.name
+        if command.args:
+            line += " " + " ".join(str(v) for v in command.args.values())
+        await self._serial.write(self._transport_path, (line + "\n").encode())
 
 
 # ---------------------------- CUSTOM DRIVERS GO ABOVE ----------------------------
@@ -217,7 +326,7 @@ class DriverFactory:
     def create_driver(self, device: Device) -> AbstractDriver:
         if device.driver == "yarp13":
             return Yarp13Driver(device, self._ros)
-        elif ...:
-            return ...
+        elif device.driver == "simple_serial":
+            return SimpleSerialDevice(device, self._serial)
         else:
             raise ValueError(f"Unknown driver: {device.driver}")

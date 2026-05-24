@@ -1,117 +1,115 @@
 import asyncio
-import time
-from typing import List, Optional, Dict, Callable, Tuple, Awaitable
-from pathlib import Path
-
-import os
+from typing import Dict, Optional, Tuple
 
 from BasicClasses import Device
+from DeviceDrivers import AbstractDriver
 from Logger import Logger
 
-#
-# class DeviceInstance:
-#     """
-#     Bonds the device and required processes.
-#
-#     transport_proc: socat - emulates a wired connection
-#     adapter_proc: protocol-required process (e.g. roslaunch)
-#     """
-#     def __init__(self, device: Device):
-#         self.device = device
-#
-#         self.transport_proc: Optional[asyncio.subprocess.Process] = None
-#         self.adapter_proc: Optional[asyncio.subprocess.Process] = None
-#
-#         self._restart_lock = asyncio.Lock()
-#
-#
-#
-#
-#     async def start(self):
-#         await self._start_transport_proc()
-#         await self._start_adapter_proc()
-#
-#     async def stop(self):
-#         for proc in [self.transport_proc, self.adapter_proc]:
-#             if proc and proc.returncode is None:
-#                 proc.terminate()
-#                 try:
-#                     await asyncio.wait_for(proc.wait(), timeout=5)
-#                 except asyncio.TimeoutError:
-#                     proc.kill()
-#
-#     async def restart(self):
-#         async with self._restart_lock:
-#             await self.stop()
-#             await asyncio.sleep(1)
-#             await self.start()
 
-
-# TODO redo with drivers or smth
 class DeviceSupervisor:
     """
-    Provides methods for monitoring devices' processes
+    Monitors device processes (transports and adapters) and restarts them on failure.
     """
 
-    # TODO make iterable make strict typization add override for driver overrides
-    class _DeviceProcesses:
-        """
-        An auxiliary class for storing processes
-        """
-        def __init__(self,
-                     transport_starter: Callable[[], Awaitable[Tuple[asyncio.subprocess.Process, ...]]],
-                     adapter_starter: Callable[[], Awaitable[Tuple[asyncio.subprocess.Process, ...]]]):
-            self._transport_starter = transport_starter
-            self._adapter_starter = adapter_starter
-            self.processes: List[asyncio.subprocess.Process] = []
+    class _DeviceState:
+        def __init__(self, driver: AbstractDriver):
+            self.driver = driver
+            self.transport_procs: Tuple[asyncio.subprocess.Process, ...] = ()
+            self.adapter_procs: Tuple[asyncio.subprocess.Process, ...] = ()
+            self.restart_lock = asyncio.Lock()
 
-        async def start(self):
-            transport_procs = await self._transport_starter()
-            adapter_procs = await self._adapter_starter()
+        def all_procs(self) -> Tuple[asyncio.subprocess.Process, ...]:
+            return self.transport_procs + self.adapter_procs
 
-            self.processes.extend(transport_procs + adapter_procs)
+        def transports_alive(self) -> bool:
+            return bool(self.transport_procs) and all(p.returncode is None for p in self.transport_procs)
+
+        def adapters_alive(self) -> bool:
+            # Empty tuple means no adapters required (e.g. SerialBasedDriver) — counts as alive.
+            return not self.adapter_procs or all(p.returncode is None for p in self.adapter_procs)
 
     def __init__(self):
-        self._procs: Dict[Device, List[asyncio.subprocess.Process]] = {}
+        self._devices: Dict[Device, DeviceSupervisor._DeviceState] = {}
+        self._running = False
+        self._watchdog_task: Optional[asyncio.Task] = None
+
+    def load_device(self, device: Device, driver: AbstractDriver):
+        self._devices[device] = DeviceSupervisor._DeviceState(driver)
+
+    @staticmethod
+    async def _start_device(device: Device, state: _DeviceState):
+        logger = Logger.get()
+        await logger.log("SUPERVISOR", f"Starting '{device.name}'...")
+        state.transport_procs = await state.driver.start_transports()
+        state.adapter_procs = await state.driver.start_adapters()
+        await state.driver.setup_telemetry()
+        await logger.log("SUPERVISOR", f"'{device.name}' started")
+
+    @staticmethod
+    async def _stop_procs(procs: Tuple[asyncio.subprocess.Process, ...]):
+        for proc in procs:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+    async def run(self):
+        if self._running:
+            return
+
+        self._running = True
+
+        for device, state in self._devices.items():
+            await self._start_device(device, state)
+
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def shutdown(self):
+        logger = Logger.get()
+        await logger.log("SUPERVISOR", "Shutting down...")
+
         self._running = False
 
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
 
-    def load_device(self, device: Device, transport_starter: Callable[[], Tuple[asyncio.subprocess.Process, ...]],
-                    adapter_starter: Callable[[], Tuple[asyncio.subprocess.Process, ...]]):
-        self._processes[device] = list()
-        self._starters[device] = DeviceSupervisor._DeviceStarters(transport_starter, adapter_starter)
-        logger = Logger.get()
-        logger.log("DEVICE_SUPERVISOR", f"Device '{device.name}' loaded")
+        for _, state in self._devices.items():
+            await state.driver.teardown_telemetry()
+            await self._stop_procs(state.all_procs())
 
+        await logger.log("SUPERVISOR", "Shutdown complete")
+
+    
+    @staticmethod
+    async def _restart_device(device: Device, state: _DeviceState):
+        async with state.restart_lock:
+            logger = Logger.get()
+            await logger.log("SUPERVISOR", f"Restarting '{device.name}'...")
+            await state.driver.teardown_telemetry()
+            await DeviceSupervisor._stop_procs(state.all_procs())
+            await asyncio.sleep(1)
+            state.transport_procs = await state.driver.start_transports()
+            state.adapter_procs = await state.driver.start_adapters()
+            await state.driver.setup_telemetry()
+            await logger.log("SUPERVISOR", f"'{device.name}' restarted")
 
     async def _watchdog_loop(self):
-        while self.running:
-            for device_instance in self._devices:
-
-                if device_instance.transport_proc and device_instance.transport_proc.returncode is not None:
-                    print(f"[DeviceSupervisor] transport is dead for {device_instance.device.name}, restarting...")
-                    asyncio.create_task(device_instance.restart())
+        logger = Logger.get()
+        while self._running:
+            for device, state in self._devices.items():
+                if state.restart_lock.locked():
                     continue
 
-                if device_instance.adapter_proc and device_instance.adapter_proc.returncode is not None:
-                    print(f"[DeviceSupervisor] adapter is dead for {device_instance.device.name}, restarting...")
-                    asyncio.create_task(device_instance.restart())
-                    continue
+                if not state.transports_alive() or not state.adapters_alive():
+                    await logger.log("SUPERVISOR", f"Process died for '{device.name}', restarting...")
+                    asyncio.create_task(self._restart_device(device, state))
 
             await asyncio.sleep(2)
 
 
-    async def run(self):
-        self.running = True
-        for device_instance in self._devices:
-            print(f"[DeviceSupervisor] Starting {device_instance.device.name}...")
-            await device_instance.start()
-        asyncio.create_task(self._watchdog_loop())
-
-
-    async def shutdown(self):
-        print("[DeviceSupervisor] Shutting down ...")
-        self.running = False
-
-        for device_instance in self._devices:
-            await device_instance.stop()

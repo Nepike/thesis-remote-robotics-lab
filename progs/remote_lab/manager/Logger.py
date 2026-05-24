@@ -13,7 +13,6 @@ class Logger:
     def get(cls) -> "Logger":
         if cls._instance is None:
             cls._instance = Logger()
-            cls._instance.log("LOGGER", "Logger singleton created")
         return cls._instance
 
     async def log(self, prefix: str, message: str):

@@ -4,9 +4,18 @@
     "ip": "192.168.0.102",
     "port": 2000,
     "driver": "yarp13",
-    "ros_namespace": "robot1/test-deivce",
+    "ros_namespace": "robot1/test-device",
     "shared": true,
     "active": true
+  },
+  {
+    "name": "Simple-sensor",
+    "ip": "192.168.0.103",
+    "port": 2000,
+    "driver": "simple_serial",
+    "baud_rate": 9600,
+    "shared": false,
+    "active": false
   }
 ]
 
