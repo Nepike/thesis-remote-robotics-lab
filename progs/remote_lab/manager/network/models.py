@@ -1,0 +1,139 @@
+"""
+Wire protocol models.
+
+All WebSocket messages are JSON objects with a "type" discriminator field.
+
+Client -> Server: IncomingMessage (discriminated union, parse with TypeAdapter)
+Server -> Client: individual Outgoing* models, serialized with .model_dump_json()
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any, Dict, List, Literal, Union
+
+from pydantic import BaseModel, Field
+
+
+# Client -> Server
+
+class SubmitMessage(BaseModel):
+    """Submit a command to one or more devices."""
+    type: Literal["submit"] = "submit"
+    devices: List[str]
+    name: str
+    priority: int = 5
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AcquireMessage(BaseModel):
+    """Acquire exclusive ownership of a device before sending commands to it."""
+    type: Literal["acquire"] = "acquire"
+    device: str
+
+
+class ReleaseMessage(BaseModel):
+    """Release exclusive ownership of a device."""
+    type: Literal["release"] = "release"
+    device: str
+
+
+class CancelMessage(BaseModel):
+    """Cancel a queued command by its id. No effect if already executing."""
+    type: Literal["cancel"] = "cancel"
+    command_id: str
+
+
+class SubscribeTelemetryMessage(BaseModel):
+    """Start receiving telemetry pushes for a device."""
+    type: Literal["subscribe_telemetry"] = "subscribe_telemetry"
+    device: str
+
+
+class UnsubscribeTelemetryMessage(BaseModel):
+    """Stop receiving telemetry pushes for a device."""
+    type: Literal["unsubscribe_telemetry"] = "unsubscribe_telemetry"
+    device: str
+
+
+class GetDevicesMessage(BaseModel):
+    """Request the list of registered active devices."""
+    type: Literal["get_devices"] = "get_devices"
+
+
+# Discriminated union — parse any incoming message with:
+#   TypeAdapter(IncomingMessage).validate_json(raw)
+IncomingMessage = Annotated[
+    Union[
+        SubmitMessage,
+        AcquireMessage,
+        ReleaseMessage,
+        CancelMessage,
+        SubscribeTelemetryMessage,
+        UnsubscribeTelemetryMessage,
+        GetDevicesMessage,
+    ],
+    Field(discriminator="type"),
+]
+
+
+# Server -> Client
+
+class AckMessage(BaseModel):
+    """Command was validated and placed in the queue."""
+    type: Literal["ack"] = "ack"
+    command_id: str
+    status: Literal["queued"] = "queued"
+
+
+class DoneMessage(BaseModel):
+    """
+    Command finished executing on a specific device.
+
+    For multi-device commands the client receives one DoneMessage per device.
+    The client-side robot.move() unblocks when it has received Done from all
+    targeted devices.
+    """
+    type: Literal["done"] = "done"
+    command_id: str
+    device: str
+
+
+class TelemetryMessage(BaseModel):
+    """
+    Telemetry snapshot pushed to subscribed clients.
+
+    `data` mirrors the fields of the driver's telemetry dataclass
+    (e.g. Yarp13Telemetry), serialized to a plain dict.
+    """
+    type: Literal["telemetry"] = "telemetry"
+    device: str
+    data: Dict[str, Any]
+
+
+class DeviceInfo(BaseModel):
+    """Lightweight device descriptor sent to clients."""
+    name: str
+    driver: str
+    shared: bool
+
+
+class DevicesMessage(BaseModel):
+    """Response to GetDevicesMessage."""
+    type: Literal["devices"] = "devices"
+    data: List[DeviceInfo]
+
+
+class ErrorMessage(BaseModel):
+    """
+    Server-side error that the client should surface to the caller.
+
+    Codes (string enum, intentionally not a Python Enum to stay wire-stable):
+        UNKNOWN_DEVICE   — device name not registered
+        ACCESS_DENIED    — client does not hold exclusive lock
+        ALREADY_OWNED    — acquire failed, device owned by another client
+        UNKNOWN_MESSAGE  — unrecognized message type
+        INTERNAL         — unexpected server-side exception
+    """
+    type: Literal["error"] = "error"
+    code: str
+    message: str

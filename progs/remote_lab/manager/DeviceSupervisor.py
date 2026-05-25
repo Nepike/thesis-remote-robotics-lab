@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from BasicClasses import Device
 from DeviceDrivers import AbstractDriver
@@ -25,13 +25,21 @@ class DeviceSupervisor:
             return bool(self.transport_procs) and all(p.returncode is None for p in self.transport_procs)
 
         def adapters_alive(self) -> bool:
-            # Empty tuple means no adapters required (e.g. SerialBasedDriver) — counts as alive.
+            # Empty tuple means no adapters required (e.g. SerialBasedDriver) - counts as alive.
             return not self.adapter_procs or all(p.returncode is None for p in self.adapter_procs)
 
     def __init__(self):
         self._devices: Dict[Device, DeviceSupervisor._DeviceState] = {}
         self._running = False
         self._watchdog_task: Optional[asyncio.Task] = None
+
+        # Optional hooks wired up by RemoteLabManager to integrate with CommandScheduler.
+        # Called with device.name when a device goes down / comes back up.
+        # Typical usage:
+        #   supervisor.on_device_down = scheduler.pause_device
+        #   supervisor.on_device_up  = scheduler.resume_device
+        self.on_device_down: Optional[Callable[[str], None]] = None
+        self.on_device_up:   Optional[Callable[[str], None]] = None
 
     def load_device(self, device: Device, driver: AbstractDriver):
         self._devices[device] = DeviceSupervisor._DeviceState(driver)
@@ -86,17 +94,26 @@ class DeviceSupervisor:
         await logger.log("SUPERVISOR", "Shutdown complete")
 
     
-    @staticmethod
-    async def _restart_device(device: Device, state: _DeviceState):
+    async def _restart_device(self, device: Device, state: _DeviceState):
         async with state.restart_lock:
             logger = Logger.get()
             await logger.log("SUPERVISOR", f"Restarting '{device.name}'...")
+
+            # Pause the command worker so no new commands start while the device is down
+            if self.on_device_down:
+                self.on_device_down(device.name)
+
             await state.driver.teardown_telemetry()
             await DeviceSupervisor._stop_procs(state.all_procs())
             await asyncio.sleep(1)
             state.transport_procs = await state.driver.start_transports()
             state.adapter_procs = await state.driver.start_adapters()
             await state.driver.setup_telemetry()
+
+            # Device is fully back - allow the command worker to continue
+            if self.on_device_up:
+                self.on_device_up(device.name)
+
             await logger.log("SUPERVISOR", f"'{device.name}' restarted")
 
     async def _watchdog_loop(self):

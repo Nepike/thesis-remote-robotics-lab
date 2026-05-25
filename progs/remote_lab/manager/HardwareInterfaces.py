@@ -22,7 +22,6 @@ class RosInterface:
         self._publishers: Dict[str, rospy.Publisher] = {}
         self._subscribers: Dict[str, rospy.Subscriber] = {}
         self._lock = Lock()
-        self._loop = asyncio.get_running_loop()
 
         rospy.loginfo("[RosInterface] initialized")
 
@@ -50,8 +49,9 @@ class RosInterface:
         event loop via run_coroutine_threadsafe. Use this for telemetry: the callback is
         scheduled on the event loop each time a message arrives.
         """
+        loop = asyncio.get_event_loop()
         def _bridge(msg):
-            asyncio.run_coroutine_threadsafe(callback(msg), self._loop)
+            asyncio.run_coroutine_threadsafe(callback(msg), loop)
 
         self.subscribe(topic, msg_type, _bridge)
 

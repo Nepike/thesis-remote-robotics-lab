@@ -57,7 +57,19 @@ class AbstractDriver(ABC):
 
         You must override this method for every device type.
         """
-        pass
+
+    # ПРИМЕР
+    # Правильно - можно прервать:
+    # async def execute_command(self, command):
+    #     self._ros.publish("/cmd_vel", Twist, move_msg)
+    #     await asyncio.sleep(command.args["duration"])  # <- CancelledError сюда
+    #     self._ros.publish("/cmd_vel", Twist, stop_msg)
+    #
+    # Неправильно - невозможно прервать:
+    # async def execute_command(self, command):
+    #     time.sleep(command.args["duration"])  # blocking — заблокирует весь event loop
+    # pass
+    # крч, длинные команды обязаны быть асинхронными, чтобы их можно было прервать...
 
     async def setup_telemetry(self):
         """Subscribe to device telemetry sources. Called after adapters are started."""
@@ -236,7 +248,7 @@ class Yarp13Driver(RosBasedDriver):
 
     async def setup_telemetry(self):
         self._ros.subscribe_async(
-            f"/{self._device.ros_namespace}/yy_sensors",
+            f"/{self._device.ros_namespace.strip('/')}/yy_sensors",
             msg_yy.msg.sens,
             self._on_sensors_msg,
         )

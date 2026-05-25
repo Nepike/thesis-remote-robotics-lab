@@ -30,29 +30,37 @@ class User:
         return self._id == other._id # I am SO sorry, I wish Python 3.8 had friend-functions
 
 
-# TODO
-@dataclass(order=True)
+@dataclass(eq=False)
 class Command:
     """
     Command object stored in device priority queues.
 
-    Ordering is based on (priority, timestamp) so PriorityQueue
-    executes higher priority commands first and keeps FIFO
-    ordering for equal priorities.
+    Ordering: higher priority number -> executed first.
+    Equal priority -> FIFO by submission timestamp.
     """
 
     priority: int
-    timestamp: float = field(init=False, compare=True)
-
-    # command_id: str = field(default_factory=lambda: str(uuid.uuid4()), compare=False)
-    # client_id: str = field(default="", compare=False)
-    #
-    # devices: List[str] = field(default_factory=list, compare=False)
-
-    name: str = field(default="", compare=False)
-    args: dict = field(default_factory=dict, compare=False)
+    client_id: str
+    devices: List[str]
+    name: str = ""
+    args: dict = field(default_factory=dict)
+    command_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: float = field(init=False)
 
     def __post_init__(self):
         self.timestamp = time.time()
+
+    # Identity is determined solely by command_id
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Command) and self.command_id == other.command_id
+
+    def __hash__(self) -> int:
+        return hash(self.command_id)
+
+    # PriorityQueue (min-heap): __lt__ returning True means "I go first"
+    def __lt__(self, other: "Command") -> bool:
+        if self.priority != other.priority:
+            return self.priority > other.priority   # higher number -> first
+        return self.timestamp < other.timestamp     # earlier submission -> FIFO
 
 
