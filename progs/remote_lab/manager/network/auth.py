@@ -84,6 +84,13 @@ def init_user_store(path: Path):
     _store = UserStore(path)
 
 
+def verify_credentials(username: str, password: str) -> bool:
+    """Verify username/password against the loaded user store"""
+    if _store is None:
+        return False
+    return _store.verify(username, password)
+
+
 def get_client_id(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
     """
     FastAPI dependency that validates HTTP Basic Auth and returns the username

@@ -11,16 +11,17 @@ Startup wiring (call once before accepting connections):
 """
 
 import asyncio
+import base64
 import dataclasses
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 
 from BasicClasses import Command
 from DeviceDrivers import AbstractDriver
 from manager import RemoteLabManager
-from network.auth import get_client_id
+from network.auth import verify_credentials
 from network.models import (
     AckMessage,
     AcquireMessage,
@@ -270,17 +271,45 @@ async def _dispatch(session: ClientSession, raw: str) -> None:
         await session.send(ErrorMessage(code="INTERNAL", message=str(e)))
 
 
-@router.websocket("/ws") # ws://server/ws
-async def websocket_endpoint(websocket: WebSocket,client_id: str = Depends(get_client_id)) -> None:
+def _parse_basic_auth(websocket: WebSocket) -> Optional[str]:
+    """
+    Extract and verify HTTP Basic Auth from the WebSocket upgrade request headers.
+
+    Returns the authenticated username, or None if auth is missing or invalid.
+    
+    HTTPBasic() from FastAPI cannot be used with WebSocket endpoints because its
+    __call__ expects a Request object, not a WebSocket.
+    """
+    auth = websocket.headers.get("authorization", "")
+    if not auth.lower().startswith("basic "):
+        return None
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8", errors="replace")
+        username, password = decoded.split(":", 1)
+    except Exception:
+        return None
+    if verify_credentials(username, password):
+        return username
+    return None
+
+
+@router.websocket("/ws")  # ws://server/ws
+async def websocket_endpoint(websocket: WebSocket) -> None:
     """
     Main WebSocket endpoint. One persistent connection per client session.
 
     Lifecycle:
-        connect (HTTP upgrade + Basic Auth check)
+        connect (HTTP upgrade + Basic Auth check via Authorization header)
         -> receive messages in a loop -> dispatch to handlers
         -> disconnect (network drop or explicit close)
         -> unsubscribe telemetry, cancel pending commands, release device locks
     """
+    client_id = _parse_basic_auth(websocket)
+    if client_id is None:
+        # Close with policy-violation code; Starlette accepts first internally.
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+
     session = await _conn_manager.connect(client_id, websocket)
     try:
         while True:
