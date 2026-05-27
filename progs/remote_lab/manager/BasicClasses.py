@@ -19,16 +19,6 @@ class Device:
     # ... for <smth>-based drivers
 
 
-class User:
-    def __init__(self):
-        self._id = str(uuid.uuid4())
-
-    def __hash__(self):
-        return hash(self._id)
-
-    def __eq__(self, other):
-        return self._id == other._id # I am SO sorry, I wish Python 3.8 had friend-functions
-
 
 @dataclass(eq=False)
 class Command:

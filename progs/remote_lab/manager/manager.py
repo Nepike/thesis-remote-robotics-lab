@@ -1,7 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 from AccessController import AccessController
 from BasicClasses import Command, Device
@@ -39,6 +39,10 @@ class RemoteLabManager:
         # device_name -> driver / Device (populated by load_config)
         self._drivers: Dict[str, AbstractDriver] = {}
         self._devices: Dict[str, Device]         = {}
+
+        # Wired by the network layer after startup.
+        # Called with (command, device_name) after every execute_command() returns.
+        self.on_command_complete: Optional[Callable[[Command, str], Awaitable[None]]] = None
 
 
     async def load_config(self, config_path: Path = Path("./devices.json")):
@@ -110,6 +114,8 @@ class RemoteLabManager:
         if driver is None:
             raise RuntimeError(f"No driver registered for '{device_name}'")
         await driver.execute_command(command)
+        if self.on_command_complete:
+            await self.on_command_complete(command, device_name)
 
 
     async def submit_command(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> str:
@@ -131,8 +137,7 @@ class RemoteLabManager:
     def acquire_device(self, device_name: str, client_id: str) -> bool:
         """
         Attempt to acquire exclusive ownership of a device.
-        Always succeeds for shared devices. Returns False if the device is
-        already owned by another client.
+        Always succeeds for shared devices. Returns False if the device is already owned by another client.
         """
         return self._access_controller.acquire(device_name, client_id)
 
@@ -155,6 +160,10 @@ class RemoteLabManager:
     def get_driver(self, device_name: str) -> Optional[AbstractDriver]:
         """Return the driver for a device, or None if not found."""
         return self._drivers.get(device_name)
+
+    def cancel_command(self, command_id: str):
+        """Cancel a specific queued command. No effect if already executing."""
+        self._scheduler.cancel(command_id)
 
 
 async def main():
