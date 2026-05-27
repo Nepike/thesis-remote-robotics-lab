@@ -247,6 +247,10 @@ class Yarp13Driver(RosBasedDriver):
     """
 
     async def setup_telemetry(self):
+        if not self._device.ros_namespace:
+            raise RuntimeError(
+                f"Device '{self._device.name}' has no ros_namespace configured"
+            )
         self._ros.subscribe_async(
             f"/{self._device.ros_namespace.strip('/')}/yy_sensors",
             msg_yy.msg.sens,
@@ -305,7 +309,7 @@ class SimpleSerialDevice(SerialBasedDriver):
 
     async def _on_line(self, line: bytes):
         try:
-            parts = dict(kv.split("=") for kv in line.decode().strip().split(","))
+            parts = dict(kv.split("=", 1) for kv in line.decode().strip().split(","))
             telemetry = SimpleSerialTelemetry(
                 uptime=int(parts["uptime"]),
                 value=float(parts["value"]),

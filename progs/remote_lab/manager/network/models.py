@@ -48,6 +48,19 @@ class CancelMessage(BaseModel):
     command_id: str
 
 
+class InterruptMessage(BaseModel):
+    """
+    Interrupt the command currently executing on a device.
+
+    Unlike CancelMessage (which removes a command from the queue),
+    InterruptMessage raises CancelledError inside the running execute_command()
+    coroutine. The worker then immediately picks up the next command in the queue.
+    No effect if the device is idle.
+    """
+    type: Literal["interrupt"] = "interrupt"
+    device: str
+
+
 class SubscribeTelemetryMessage(BaseModel):
     """Start receiving telemetry pushes for a device."""
     type: Literal["subscribe_telemetry"] = "subscribe_telemetry"
@@ -73,6 +86,7 @@ IncomingMessage = Annotated[
         AcquireMessage,
         ReleaseMessage,
         CancelMessage,
+        InterruptMessage,
         SubscribeTelemetryMessage,
         UnsubscribeTelemetryMessage,
         GetDevicesMessage,

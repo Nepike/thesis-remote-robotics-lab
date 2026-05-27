@@ -32,6 +32,7 @@ from network.models import (
     ErrorMessage,
     GetDevicesMessage,
     IncomingMessage,
+    InterruptMessage,
     ReleaseMessage,
     SubmitMessage,
     SubscribeTelemetryMessage,
@@ -219,6 +220,10 @@ async def _handle_cancel(session: ClientSession, msg: CancelMessage) -> None:
     _manager.cancel_command(msg.command_id)
 
 
+async def _handle_interrupt(session: ClientSession, msg: InterruptMessage) -> None:
+    _manager.interrupt_device(msg.device)
+
+
 async def _handle_subscribe(session: ClientSession, msg: SubscribeTelemetryMessage) -> None:
     driver = _manager.get_driver(msg.device)
     if driver is None:
@@ -261,6 +266,8 @@ async def _dispatch(session: ClientSession, raw: str) -> None:
             await _handle_release(session, msg)
         elif isinstance(msg, CancelMessage):
             await _handle_cancel(session, msg)
+        elif isinstance(msg, InterruptMessage):
+            await _handle_interrupt(session, msg)
         elif isinstance(msg, SubscribeTelemetryMessage):
             await _handle_subscribe(session, msg)
         elif isinstance(msg, UnsubscribeTelemetryMessage):
@@ -276,7 +283,7 @@ def _parse_basic_auth(websocket: WebSocket) -> Optional[str]:
     Extract and verify HTTP Basic Auth from the WebSocket upgrade request headers.
 
     Returns the authenticated username, or None if auth is missing or invalid.
-    
+
     HTTPBasic() from FastAPI cannot be used with WebSocket endpoints because its
     __call__ expects a Request object, not a WebSocket.
     """

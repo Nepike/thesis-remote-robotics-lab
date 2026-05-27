@@ -165,6 +165,16 @@ class RemoteLabManager:
         """Cancel a specific queued command. No effect if already executing."""
         self._scheduler.cancel(command_id)
 
+    def interrupt_device(self, device_name: str):
+        """
+        Interrupt the command currently executing on a device.
+
+        Raises CancelledError inside the running execute_command() coroutine.
+        The worker catches it, logs it, and immediately picks up the next command.
+        No effect if the device is idle.
+        """
+        self._scheduler.interrupt_device(device_name)
+
 
 async def main():
     manager = RemoteLabManager()
