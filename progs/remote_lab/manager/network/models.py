@@ -9,7 +9,12 @@ Server -> Client: individual Outgoing* models, serialized with .model_dump_json(
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Dict, List, Literal, Union
+from typing import Any, Dict, List, Literal, Union
+
+try:
+    from typing import Annotated          # Python 3.9+
+except ImportError:
+    from typing_extensions import Annotated  # Python 3.8
 
 from pydantic import BaseModel, Field
 
