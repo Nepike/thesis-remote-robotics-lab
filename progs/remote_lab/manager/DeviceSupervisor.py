@@ -94,6 +94,13 @@ class DeviceSupervisor:
         await logger.log("SUPERVISOR", "Shutdown complete")
 
     
+    async def _safe_restart(self, device: Device, state: _DeviceState):
+        try:
+            await self._restart_device(device, state)
+        except Exception as e:
+            logger = Logger.get()
+            await logger.log("SUPERVISOR", f"Restart of '{device.name}' failed: {e}")
+
     async def _restart_device(self, device: Device, state: _DeviceState):
         async with state.restart_lock:
             logger = Logger.get()
@@ -125,7 +132,7 @@ class DeviceSupervisor:
 
                 if not state.transports_alive() or not state.adapters_alive():
                     await logger.log("SUPERVISOR", f"Process died for '{device.name}', restarting...")
-                    asyncio.create_task(self._restart_device(device, state))
+                    asyncio.create_task(self._safe_restart(device, state))
 
             await asyncio.sleep(2)
 

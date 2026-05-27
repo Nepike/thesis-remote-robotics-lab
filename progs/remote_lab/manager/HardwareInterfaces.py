@@ -49,7 +49,7 @@ class RosInterface:
         event loop via run_coroutine_threadsafe. Use this for telemetry: the callback is
         scheduled on the event loop each time a message arrives.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         def _bridge(msg):
             asyncio.run_coroutine_threadsafe(callback(msg), loop)
 

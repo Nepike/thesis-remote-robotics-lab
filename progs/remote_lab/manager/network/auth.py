@@ -36,14 +36,17 @@ def _hash_password(password: str) -> str:
 
 def _verify_password(password: str, stored: str) -> bool:
     try:
-        _, algo_part, iter_part, salt_hex, hash_hex = stored.split(":")
+        parts = stored.split(":")
+        if len(parts) != 4:
+            return False
+        algo_full, iter_s, salt_hex, hash_hex = parts
+        algo     = algo_full.split("_", 1)[1]   # "pbkdf2_sha256" -> "sha256"
         salt     = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(hash_hex)
-        algo     = algo_part.removeprefix("pbkdf2_")
-    except (ValueError, AttributeError):
+    except (ValueError, IndexError):
         return False
 
-    dk = hashlib.pbkdf2_hmac(algo, password.encode(), salt, int(iter_part))
+    dk = hashlib.pbkdf2_hmac(algo, password.encode(), salt, int(iter_s))
     return hmac.compare_digest(dk, expected)
 
 
