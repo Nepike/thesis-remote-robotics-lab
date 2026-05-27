@@ -602,14 +602,14 @@ async def _run_async_tests():
         # Invalid credentials must be rejected
         rejected = False
         try:
-            async with _ws.connect(ws_url, additional_headers=bad_hdr):
+            async with _ws.connect(ws_url, extra_headers=bad_hdr):
                 pass
         except Exception:
             rejected = True
         _assert("Invalid credentials: connection rejected", rejected)
 
         # Main protocol test
-        async with _ws.connect(ws_url, additional_headers=auth_hdr) as ws:
+        async with _ws.connect(ws_url, extra_headers=auth_hdr) as ws:
 
             # get_devices
             await ws.send(json.dumps({"type": "get_devices"}))
@@ -689,7 +689,7 @@ async def _run_async_tests():
                 _ok("cancel: sent without crash")
 
         # Second connection with same user — first one should be evicted
-        async with _ws.connect(ws_url, additional_headers=auth_hdr) as ws2:
+        async with _ws.connect(ws_url, extra_headers=auth_hdr) as ws2:
             await ws2.send(json.dumps({"type": "get_devices"}))
             msg2 = json.loads(await asyncio.wait_for(ws2.recv(), timeout=5.0))
             _assert("New connection after old one: get_devices works",
