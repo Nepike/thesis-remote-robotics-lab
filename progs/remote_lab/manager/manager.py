@@ -123,21 +123,29 @@ class RemoteLabManager:
         driver = self._drivers.get(device_name)
         if driver is None:
             raise RuntimeError(f"No driver registered for '{device_name}'")
-        await driver.execute_command(command)
+        try:
+            await driver.execute_command(command)
+        finally:
+            # Always notify completion — even when the command was interrupted
+            # via interrupt_device() (CancelledError).  Without this the client's
+            # CommandHandle would hang forever waiting for a DoneMessage that
+            # is never sent.
+            if self.on_command_complete:
+                try:
+                    await self.on_command_complete(command, device_name)
+                except Exception:
+                    pass  # don't mask CancelledError or the driver exception
 
-        if self.on_command_complete:
-            await self.on_command_complete(command, device_name)
-
-        # Notify any procedure that is awaiting this command's completion.
-        waiter = self._command_waiters.get(command.command_id)
-        if waiter:
-            event, remaining = waiter
-            remaining -= 1
-            if remaining <= 0:
-                self._command_waiters.pop(command.command_id, None)
-                event.set()
-            else:
-                self._command_waiters[command.command_id] = (event, remaining)
+            # Unblock any procedure that is awaiting this command's completion.
+            waiter = self._command_waiters.get(command.command_id)
+            if waiter:
+                event, remaining = waiter
+                remaining -= 1
+                if remaining <= 0:
+                    self._command_waiters.pop(command.command_id, None)
+                    event.set()
+                else:
+                    self._command_waiters[command.command_id] = (event, remaining)
 
 
     async def submit_command(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> str:

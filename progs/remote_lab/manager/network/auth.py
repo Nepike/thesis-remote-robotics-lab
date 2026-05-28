@@ -91,22 +91,22 @@ def verify_credentials(username: str, password: str) -> bool:
     return _store.verify(username, password)
 
 
-def get_client_id(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
-    """
-    FastAPI dependency that validates HTTP Basic Auth and returns the username
-    as client_id. Use in route handlers: `client_id: str = Depends(get_client_id)`.
-    """
-    if _store is None:
-        raise RuntimeError("UserStore not initialised — call init_user_store() first")
-
-    if not _store.verify(credentials.username, credentials.password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-    return credentials.username
+# def get_client_id(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
+#     """
+#     FastAPI dependency that validates HTTP Basic Auth and returns the username
+#     as client_id. Use in route handlers: `client_id: str = Depends(get_client_id)`.
+#     """
+#     if _store is None:
+#         raise RuntimeError("UserStore not initialised — call init_user_store() first")
+#
+#     if not _store.verify(credentials.username, credentials.password):
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Invalid credentials",
+#             headers={"WWW-Authenticate": "Basic"},
+#         )
+#
+#     return credentials.username
 
 
 # CLI

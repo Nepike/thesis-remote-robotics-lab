@@ -471,6 +471,31 @@ class SimpleSerialDevice(SerialBasedDriver):
 # ---------------------------- CUSTOM DRIVERS GO ABOVE ----------------------------
 
 
+class MockDriver(AbstractDriver):
+    """
+    Test-only driver — no hardware, no external processes, no ROS.
+
+    Simulates timed commands via asyncio.sleep so that interrupt_device()
+    and cancel logic can be exercised without real devices.
+
+    Register in devices.json with "driver": "mock".
+    """
+
+    async def start_transports(self) -> Tuple[asyncio.subprocess.Process, ...]:
+        return ()
+
+    async def start_adapters(self) -> Tuple[asyncio.subprocess.Process, ...]:
+        return ()
+
+    async def execute_command(self, command: Command):
+        duration = float(command.args.get("duration", 0.0))
+        if duration > 0:
+            try:
+                await asyncio.sleep(duration)
+            finally:
+                pass  # no hardware to stop
+
+
 class DriverFactory:
     """
     Factory for creating drivers.
@@ -484,5 +509,7 @@ class DriverFactory:
             return Yarp13Driver(device, self._ros)
         elif device.driver == "simple_serial":
             return SimpleSerialDevice(device, self._serial)
+        elif device.driver == "mock":
+            return MockDriver(device)
         else:
             raise ValueError(f"Unknown driver: {device.driver}")
