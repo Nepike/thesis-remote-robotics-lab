@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 
 # Available once the package has been built via catkin and the ROS environment has been loaded (source devel/setup.bash).
+import geometry_msgs.msg
 import msg_yy.msg
 
 from BasicClasses import Device, Command
@@ -53,23 +54,29 @@ class AbstractDriver(ABC):
     @abstractmethod
     async def execute_command(self, command: Command):
         """
-        Executes a command via some HardwareInterface.
+        Execute a command on the physical device.
 
-        You must override this method for every device type.
+        CONTRACT for commands that take time (movement, timed beep, etc.):
+          - Use `await asyncio.sleep(duration)` — NOT time.sleep() - so the
+            event loop stays unblocked and CancelledError can arrive.
+          - Wrap the sleep in try/finally and send a physical stop in the
+            finally block.  This guarantees the device halts when the command
+            is interrupted via interrupt_device() or stop_all.
+
+        Instantaneous commands (beep_on, set_servo, …) have no await and need
+        no finally — CancelledError cannot reach them mid-execution.
+
+        Example (correct):
+            twist_move = ...
+            self._ros.publish(topic, Twist, twist_move)
+            try:
+                await asyncio.sleep(command.args["duration"])
+            finally:
+                self._ros.publish(topic, Twist, Twist())  # stop
+
+        Example (wrong - blocks the event loop, cannot be interrupted):
+            time.sleep(command.args["duration"])
         """
-
-    # ПРИМЕР
-    # Правильно - можно прервать:
-    # async def execute_command(self, command):
-    #     self._ros.publish("/cmd_vel", Twist, move_msg)
-    #     await asyncio.sleep(command.args["duration"])  # <- CancelledError сюда
-    #     self._ros.publish("/cmd_vel", Twist, stop_msg)
-    #
-    # Неправильно - невозможно прервать:
-    # async def execute_command(self, command):
-    #     time.sleep(command.args["duration"])  # blocking — заблокирует весь event loop
-    # pass
-    # крч, длинные команды обязаны быть асинхронными, чтобы их можно было прервать...
 
     async def setup_telemetry(self):
         """Subscribe to device telemetry sources. Called after adapters are started."""
@@ -97,6 +104,7 @@ class AbstractDriver(ABC):
         # It iterates over a copy of the dictionary because the listener could theoretically remove itself during the call
         for callback in list(self._telemetry_listeners.values()):
             await callback(telemetry)
+
 
 
 # ---------------------------- STARTERS POOL GO HERE ----------------------------
@@ -285,8 +293,140 @@ class Yarp13Driver(RosBasedDriver):
         await self._notify_listeners(telemetry)
 
     async def execute_command(self, command: Command):
-        # TODO
-        pass
+        # Command codes for msg_yy::cmd (from y13cmd.h)
+        _Y13_CMD = {
+            "beep_on": 1,
+            "beep_off": 2,
+            "gun_on": 3,
+            "gun_off": 4,
+            "set_servo": 5,
+            "set_refl_dist": 6,
+            "set_enc": 7,
+            "set_pid": 8,
+            "compass_calibr": 9,
+            "set_calibr_speed": 10,
+            "set_motors_ratio": 11,
+            "set_pid_left": 12,
+            "set_pid_right": 13,
+            "usr": 14,
+            "dctl": 15,
+            "pidctl": 16,
+        }
+
+        # Subcodes for CMD_USR (da[0])
+        _Y13_SUBCMD = {
+            "set_rc5": 1,
+            "set_klpf": 2,
+        }
+
+
+        ns = self._device.ros_namespace.strip("/")
+        a  = command.args or {}
+
+        if command.name == "move":
+            # Publish velocity and hold for `duration` seconds.
+            # On interrupt (CancelledError), the finally block sends a stop before propagating.
+            twist = geometry_msgs.msg.Twist()
+            twist.linear.x  = float(a.get("speed_lin", 0.0))
+            twist.angular.z = float(a.get("speed_ang", 0.0))
+            self._ros.publish(f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, twist)
+            try:
+                await asyncio.sleep(float(a.get("duration", 0.0)))
+            finally:
+                self._ros.publish(
+                    f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, geometry_msgs.msg.Twist()
+                )
+
+        elif command.name == "stop":
+            # Zero Twist stops both motors regardless of current control mode.
+            self._ros.publish(
+                f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, geometry_msgs.msg.Twist()
+            )
+
+        elif command.name in ("dctl", "pidctl"):
+            # Direct PWM or PID wheel speed.  arg: w_l, w_r in [-255, +255], optional duration.
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD[command.name]
+            yy.arg     = [float(a.get("w_l", 0.0)), float(a.get("w_r", 0.0))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            try:
+                await asyncio.sleep(float(a.get("duration", 0.0)))
+            finally:
+                stop = msg_yy.msg.cmd()
+                stop.command = _Y13_CMD[command.name]
+                stop.arg     = [0.0, 0.0]
+                self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, stop)
+
+        elif command.name in ("beep_on", "beep_off", "gun_on", "gun_off", "compass_calibr"):
+            # Instantaneous toggle commands — no duration.
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD[command.name]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name == "beep":
+            # Convenience: beep_on → sleep → beep_off.  arg: duration (seconds).
+            on = msg_yy.msg.cmd()
+            on.command = _Y13_CMD["beep_on"]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, on)
+            try:
+                await asyncio.sleep(float(a.get("duration", 0.5)))
+            finally:
+                off = msg_yy.msg.cmd()
+                off.command = _Y13_CMD["beep_off"]
+                self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, off)
+
+        elif command.name == "set_servo":
+            # arg: a0, a1, a2 — angles in degrees for each of the 3 servos.
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD["set_servo"]
+            yy.angle   = [int(a.get("a0", 90)), int(a.get("a1", 90)), int(a.get("a2", 90))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name in ("set_pid", "set_pid_left", "set_pid_right"):
+            # arg: kp, ki, kd
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD[command.name]
+            yy.arg     = [float(a.get("kp", 0.5)), float(a.get("ki", 0.02)), float(a.get("kd", 0.2))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name == "set_enc":
+            # arg: left, right — reset encoder counters to these values.
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD["set_enc"]
+            yy.arg     = [float(a.get("left", 0)), float(a.get("right", 0))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name == "set_refl_dist":
+            # arg: center, left, right — obstacle reflex distances in cm.
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD["set_refl_dist"]
+            yy.arg     = [float(a.get("center", 20)), float(a.get("left", 20)), float(a.get("right", 20))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name == "set_motors_ratio":
+            # arg: left, right — scaling factors to balance drive motors.
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD["set_motors_ratio"]
+            yy.arg     = [float(a.get("left", 1.0)), float(a.get("right", 1.0))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name == "set_calibr_speed":
+            # arg: speed (PWM during calibration spin), max_cnt (number of ticks).
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD["set_calibr_speed"]
+            yy.arg     = [float(a.get("speed", 40)), float(a.get("max_cnt", 600))]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        elif command.name == "set_klpf":
+            # arg: k — low-pass filter coefficient for drive speed (0..1).
+            yy = msg_yy.msg.cmd()
+            yy.command = _Y13_CMD["usr"]
+            yy.arg     = [float(a.get("k", 1.0))]
+            yy.da      = [_Y13_SUBCMD["set_klpf"], 0, 0, 0]
+            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+
+        else:
+            raise ValueError(f"Unknown command '{command.name}' for Yarp13Driver")
 
 
 class SimpleSerialDevice(SerialBasedDriver):

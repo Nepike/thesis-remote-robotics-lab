@@ -26,6 +26,7 @@ from network.models import (
     AckMessage,
     AcquireMessage,
     CancelMessage,
+    CancelProcedureMessage,
     DeviceInfo,
     DevicesMessage,
     DoneMessage,
@@ -33,7 +34,11 @@ from network.models import (
     GetDevicesMessage,
     IncomingMessage,
     InterruptMessage,
+    ProcedureAckMessage,
+    ProcedureDoneMessage,
+    ProcedureErrorMessage,
     ReleaseMessage,
+    RunProcedureMessage,
     SubmitMessage,
     SubscribeTelemetryMessage,
     TelemetryMessage,
@@ -166,6 +171,18 @@ class ConnectionManager:
         else:
             self._command_pending[command.command_id] = remaining
 
+    async def on_procedure_done(self, procedure_id: str, client_id: str) -> None:
+        """Called by ProcedureManager when a procedure finishes successfully."""
+        session = self._sessions.get(client_id)
+        if session:
+            await session.send(ProcedureDoneMessage(procedure_id=procedure_id))
+
+    async def on_procedure_error(self, procedure_id: str, client_id: str, message: str) -> None:
+        """Called by ProcedureManager when a procedure raises an exception."""
+        session = self._sessions.get(client_id)
+        if session:
+            await session.send(ProcedureErrorMessage(procedure_id=procedure_id, message=message))
+
 
 def init(manager: RemoteLabManager) -> None:
     """
@@ -177,6 +194,9 @@ def init(manager: RemoteLabManager) -> None:
     _conn_manager = ConnectionManager()
 
     _manager.on_command_complete = _conn_manager.on_command_complete
+
+    _manager.procedure_manager.on_done  = _conn_manager.on_procedure_done
+    _manager.procedure_manager.on_error = _conn_manager.on_procedure_error
 
 
 # Message handlers.
@@ -246,6 +266,19 @@ async def _handle_get_devices(session: ClientSession, _msg: GetDevicesMessage) -
     await session.send(DevicesMessage(data=infos))
 
 
+async def _handle_run_procedure(session: ClientSession, msg: RunProcedureMessage) -> None:
+    try:
+        procedure_id = await _manager.run_procedure(msg.name, session.client_id, msg.args)
+    except ValueError as e:
+        await session.send(ErrorMessage(code="UNKNOWN_PROCEDURE", message=str(e)))
+        return
+    await session.send(ProcedureAckMessage(procedure_id=procedure_id))
+
+
+async def _handle_cancel_procedure(session: ClientSession, msg: CancelProcedureMessage) -> None:
+    _manager.cancel_procedure(msg.procedure_id)
+
+
 async def _dispatch(session: ClientSession, raw: str) -> None:
     """
     Parse one raw JSON string into a typed message and call the right handler.
@@ -274,6 +307,10 @@ async def _dispatch(session: ClientSession, raw: str) -> None:
             await _handle_unsubscribe(session, msg)
         elif isinstance(msg, GetDevicesMessage):
             await _handle_get_devices(session, msg)
+        elif isinstance(msg, RunProcedureMessage):
+            await _handle_run_procedure(session, msg)
+        elif isinstance(msg, CancelProcedureMessage):
+            await _handle_cancel_procedure(session, msg)
     except Exception as e:
         await session.send(ErrorMessage(code="INTERNAL", message=str(e)))
 

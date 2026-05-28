@@ -1,7 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from AccessController import AccessController
 from BasicClasses import Command, Device
@@ -10,6 +10,7 @@ from DeviceDrivers import AbstractDriver, DriverFactory
 from DeviceSupervisor import DeviceSupervisor
 from HardwareInterfaces import RosInterface, SerialInterface
 from Logger import Logger
+from Procedures import AllGoHome, StopAll, ProcedureManager
 
 
 class RemoteLabManager:
@@ -22,7 +23,8 @@ class RemoteLabManager:
         await manager.start()         # bring devices up, then start scheduler workers
 
     Public API (called by the network layer once it exists):
-        submit_command / acquire_device / release_device / on_client_disconnect
+        submit_command / submit_command_wait / acquire_device / release_device
+        run_procedure / cancel_procedure / on_client_disconnect
         get_devices / get_driver
     """
 
@@ -39,6 +41,14 @@ class RemoteLabManager:
         # device_name -> driver / Device (populated by load_config)
         self._drivers: Dict[str, AbstractDriver] = {}
         self._devices: Dict[str, Device]         = {}
+
+        # command_id -> (done_event, remaining_device_count)
+        # Used by procedures to await command completion server-side.
+        self._command_waiters: Dict[str, Tuple[asyncio.Event, int]] = {}
+
+        self._procedure_manager = ProcedureManager(self)
+        self._procedure_manager.register(StopAll())
+        self._procedure_manager.register(AllGoHome())
 
         # Wired by the network layer after startup.
         # Called with (command, device_name) after every execute_command() returns.
@@ -114,8 +124,20 @@ class RemoteLabManager:
         if driver is None:
             raise RuntimeError(f"No driver registered for '{device_name}'")
         await driver.execute_command(command)
+
         if self.on_command_complete:
             await self.on_command_complete(command, device_name)
+
+        # Notify any procedure that is awaiting this command's completion.
+        waiter = self._command_waiters.get(command.command_id)
+        if waiter:
+            event, remaining = waiter
+            remaining -= 1
+            if remaining <= 0:
+                self._command_waiters.pop(command.command_id, None)
+                event.set()
+            else:
+                self._command_waiters[command.command_id] = (event, remaining)
 
 
     async def submit_command(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> str:
@@ -134,6 +156,18 @@ class RemoteLabManager:
 
         return await self._scheduler.submit(client_id, devices, command_name, priority, args)
 
+    async def submit_command_wait(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None):
+        """
+        Submit a command and block until all targeted devices finish executing it.
+
+        Intended for use inside procedures, where the procedure coroutine needs to
+        know when a movement has physically completed before issuing the next one.
+        """
+        command_id = await self.submit_command(client_id, devices, command_name, priority, args)
+        event = asyncio.Event()
+        self._command_waiters[command_id] = (event, len(devices))
+        await event.wait()
+
     def acquire_device(self, device_name: str, client_id: str) -> bool:
         """
         Attempt to acquire exclusive ownership of a device.
@@ -148,10 +182,11 @@ class RemoteLabManager:
     def on_client_disconnect(self, client_id: str):
         """
         Clean up all state associated with a disconnected client:
-        cancels pending commands and releases exclusive device locks.
+        cancels pending commands, releases device locks, and cancels procedures.
         """
         self._scheduler.cancel_client_commands(client_id)
         self._access_controller.release_all(client_id)
+        self._procedure_manager.cancel_all_for_client(client_id)
 
     def get_devices(self) -> List[Device]:
         """Return a list of all registered active devices."""
@@ -174,6 +209,37 @@ class RemoteLabManager:
         No effect if the device is idle.
         """
         self._scheduler.interrupt_device(device_name)
+
+    def cancel_all_commands(self):
+        """
+        Cancel every command currently waiting in any device queue.
+        Also unblocks any procedure suspended in submit_command_wait() so it
+        does not hang after its command was canceled.
+        """
+        self._scheduler.cancel_all_pending()
+        for event, _ in list(self._command_waiters.values()):
+            event.set()
+        self._command_waiters.clear()
+
+    def interrupt_all_devices(self):
+        """Interrupt the command currently executing on every device."""
+        self._scheduler.interrupt_all_devices()
+
+    async def run_procedure(self, name: str, client_id: str, args: dict) -> str:
+        """
+        Start a group procedure by name. Returns procedure_id immediately.
+        Raises ValueError if the procedure name is not registered.
+        """
+        return await self._procedure_manager.run(name, client_id, args)
+
+    def cancel_procedure(self, procedure_id: str):
+        """Cancel a running procedure. No-op if already finished."""
+        self._procedure_manager.cancel(procedure_id)
+
+    @property
+    def procedure_manager(self) -> ProcedureManager:
+        """Expose ProcedureManager so ws_handler can wire its callbacks."""
+        return self._procedure_manager
 
 
 async def main():

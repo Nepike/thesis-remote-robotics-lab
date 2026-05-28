@@ -78,6 +78,19 @@ class GetDevicesMessage(BaseModel):
     type: Literal["get_devices"] = "get_devices"
 
 
+class RunProcedureMessage(BaseModel):
+    """Start a named group procedure on the server."""
+    type: Literal["run_procedure"] = "run_procedure"
+    name: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CancelProcedureMessage(BaseModel):
+    """Cancel a running procedure by its id."""
+    type: Literal["cancel_procedure"] = "cancel_procedure"
+    procedure_id: str
+
+
 # Discriminated union — parse any incoming message with:
 #   TypeAdapter(IncomingMessage).validate_json(raw)
 IncomingMessage = Annotated[
@@ -90,6 +103,8 @@ IncomingMessage = Annotated[
         SubscribeTelemetryMessage,
         UnsubscribeTelemetryMessage,
         GetDevicesMessage,
+        RunProcedureMessage,
+        CancelProcedureMessage,
     ],
     Field(discriminator="type"),
 ]
@@ -142,16 +157,36 @@ class DevicesMessage(BaseModel):
     data: List[DeviceInfo]
 
 
+class ProcedureAckMessage(BaseModel):
+    """Procedure was accepted and started; procedure_id identifies it from now on."""
+    type: Literal["procedure_ack"] = "procedure_ack"
+    procedure_id: str
+
+
+class ProcedureDoneMessage(BaseModel):
+    """Procedure finished successfully."""
+    type: Literal["procedure_done"] = "procedure_done"
+    procedure_id: str
+
+
+class ProcedureErrorMessage(BaseModel):
+    """Procedure failed with an exception."""
+    type: Literal["procedure_error"] = "procedure_error"
+    procedure_id: str
+    message: str
+
+
 class ErrorMessage(BaseModel):
     """
     Server-side error that the client should surface to the caller.
 
     Codes (string enum, intentionally not a Python Enum to stay wire-stable):
-        UNKNOWN_DEVICE   — device name not registered
-        ACCESS_DENIED    — client does not hold exclusive lock
-        ALREADY_OWNED    — acquire failed, device owned by another client
-        UNKNOWN_MESSAGE  — unrecognized message type
-        INTERNAL         — unexpected server-side exception
+        UNKNOWN_DEVICE     — device name not registered
+        ACCESS_DENIED      — client does not hold exclusive lock
+        ALREADY_OWNED      — acquire failed, device owned by another client
+        UNKNOWN_PROCEDURE  — procedure name not registered on the server
+        UNKNOWN_MESSAGE    — unrecognized message type
+        INTERNAL           — unexpected server-side exception
     """
     type: Literal["error"] = "error"
     code: str

@@ -43,6 +43,9 @@ class SubmitError(RemoteLabError):
     """Server rejected the submitted command (ACCESS_DENIED or UNKNOWN_DEVICE)."""
 
 
+class ProcedureError(RemoteLabError):
+    """Server rejected or failed a procedure (UNKNOWN_PROCEDURE or runtime error)."""
+
 
 class _PendingCommand:
     """
@@ -92,6 +95,39 @@ class _PendingCommand:
             raise self._error
 
 
+class _PendingProcedure:
+    """Tracks one running server-side procedure until it completes or errors."""
+
+    def __init__(self, procedure_id: str):
+        self.procedure_id = procedure_id
+        self._event = asyncio.Event()
+        self._error: Optional[str] = None
+
+    def notify_done(self):
+        self._event.set()
+
+    def notify_error(self, message: str):
+        self._error = message
+        self._event.set()
+
+    def fail(self, exc: Exception):
+        """Unblock any waiter with an error (called on unexpected disconnect)."""
+        self._error = str(exc)
+        self._event.set()
+
+    @property
+    def done(self) -> bool:
+        return self._event.is_set() and not self._error
+
+    async def wait(self, timeout: Optional[float] = None):
+        if timeout is not None:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        else:
+            await self._event.wait()
+        if self._error:
+            raise ProcedureError(self._error)
+
+
 class Connection:
     """
     Persistent WebSocket connection to the RemoteLab server.
@@ -139,6 +175,10 @@ class Connection:
         # Telemetry
         self._telemetry_callbacks: Dict[str, Callable[[dict], None]] = {}
         self._latest_telemetry: Dict[str, dict] = {}
+
+        # Procedures
+        self._pending_proc_acks: Deque[asyncio.Future] = deque()
+        self._pending_procedures: Dict[str, _PendingProcedure] = {}
 
         # Acquire tracking
         # Devices this client currently holds (auto re-acquired after reconnect).
@@ -228,6 +268,24 @@ class Connection:
             if self._devices_future and not self._devices_future.done():
                 self._devices_future.set_result(msg.get("data", []))
 
+        elif t == "procedure_ack":
+            if self._pending_proc_acks:
+                fut = self._pending_proc_acks.popleft()
+                if not fut.done():
+                    fut.set_result(msg)
+
+        elif t == "procedure_done":
+            procedure_id = msg.get("procedure_id", "")
+            pending = self._pending_procedures.pop(procedure_id, None)
+            if pending:
+                pending.notify_done()
+
+        elif t == "procedure_error":
+            procedure_id = msg.get("procedure_id", "")
+            pending = self._pending_procedures.pop(procedure_id, None)
+            if pending:
+                pending.notify_error(msg.get("message", "Procedure failed"))
+
         elif t == "error":
             self._handle_server_error(msg)
 
@@ -242,6 +300,11 @@ class Connection:
             # Failure response for the in-flight acquire
             self._pending_acquire_error = message
             self._pending_acquire_event.set()
+
+        elif code == "UNKNOWN_PROCEDURE" and self._pending_proc_acks:
+            fut = self._pending_proc_acks.popleft()
+            if not fut.done():
+                fut.set_exception(ProcedureError(f"{code}: {message}"))
 
         elif code in ("ACCESS_DENIED", "UNKNOWN_DEVICE") and self._pending_acks:
             # Server responded with an error instead of an ack for the in-flight submit
@@ -304,6 +367,15 @@ class Connection:
 
         if self._devices_future and not self._devices_future.done():
             self._devices_future.set_exception(exc)
+
+        while self._pending_proc_acks:
+            fut = self._pending_proc_acks.popleft()
+            if not fut.done():
+                fut.set_exception(exc)
+
+        for pending in list(self._pending_procedures.values()):
+            pending.fail(exc)
+        self._pending_procedures.clear()
 
 
     async def _send(self, msg: dict):
@@ -434,3 +506,35 @@ class Connection:
     def get_latest_telemetry(self, device: str) -> Optional[dict]:
         """Return the most recent telemetry snapshot for a device, or None."""
         return self._latest_telemetry.get(device)
+
+    async def run_procedure(self, name: str, args: dict) -> "_PendingProcedure":
+        """
+        Ask the server to start a group procedure.
+
+        Returns a _PendingProcedure that can be awaited for completion.
+        Raises ProcedureError if the server does not recognise the procedure name.
+        """
+        loop = asyncio.get_running_loop()
+        ack_future: asyncio.Future = loop.create_future()
+
+        await self._ready.wait()
+        if not self._connected:
+            raise ConnectionLostError("Not connected to RemoteLab server")
+
+        async with self._send_lock:
+            self._pending_proc_acks.append(ack_future)
+            await self._ws.send(json.dumps({"type": "run_procedure", "name": name, "args": args}))
+
+        try:
+            ack = await asyncio.wait_for(ack_future, timeout=self._ACK_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ProcedureError(f"No ack from server within {self._ACK_TIMEOUT} s")
+
+        procedure_id = ack["procedure_id"]
+        pending = _PendingProcedure(procedure_id=procedure_id)
+        self._pending_procedures[procedure_id] = pending
+        return pending
+
+    async def cancel_procedure(self, procedure_id: str):
+        """Ask the server to cancel a running procedure."""
+        await self._send({"type": "cancel_procedure", "procedure_id": procedure_id})

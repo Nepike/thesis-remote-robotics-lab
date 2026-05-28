@@ -5,9 +5,11 @@ from ._connection import (
     AcquireError,       # noqa: F401 - re-exported for user convenience
     Connection,
     ConnectionLostError,  # noqa: F401
+    ProcedureError,     # noqa: F401
     RemoteLabError,     # noqa: F401
     SubmitError,        # noqa: F401
     _PendingCommand,
+    _PendingProcedure,
 )
 
 
@@ -64,6 +66,53 @@ class CommandHandle:
         """Enables: await cmd  (equivalent to await cmd.wait())."""
         return self._pending.wait().__await__()
 
+
+
+class ProcedureHandle:
+    """
+    Handle for a running server-side group procedure. Returned by lab.run_procedure().
+
+        proc = await lab.run_procedure("all_go_home")
+
+        # Option A: fire-and-forget
+        # (the procedure keeps running independently on the server)
+
+        # Option B: wait for completion
+        await proc
+
+        # Option C: wait with timeout
+        await proc.wait(timeout=60.0)
+
+        # Option D: cancel
+        proc.cancel()
+    """
+
+    def __init__(self, pending: _PendingProcedure, conn: Connection):
+        self._pending = pending
+        self._conn    = conn
+
+    @property
+    def procedure_id(self) -> str:
+        return self._pending.procedure_id
+
+    @property
+    def done(self) -> bool:
+        return self._pending.done
+
+    def cancel(self):
+        """Ask the server to cancel this procedure (no await)."""
+        asyncio.create_task(self._conn.cancel_procedure(self._pending.procedure_id))
+
+    async def wait(self, timeout: Optional[float] = None):
+        """
+        Block until the procedure finishes.
+        Raises ProcedureError if the procedure fails on the server.
+        Raises asyncio.TimeoutError if timeout is exceeded.
+        """
+        await self._pending.wait(timeout=timeout)
+
+    def __await__(self):
+        return self._pending.wait().__await__()
 
 
 class AcquireContext:
@@ -279,6 +328,30 @@ class RemoteLab:
         """
         return await self._conn.get_devices()
 
+
+    async def run_procedure(self, name: str, **args) -> ProcedureHandle:
+        """
+        Start a named group procedure on the server.
+
+        Returns a ProcedureHandle immediately after the server accepts the request.
+        The procedure runs independently on the server - the client can await the handle or fire-and-forget.
+
+        Args:
+            name:  Procedure name registered on the server (e.g. "all_go_home").
+            **args: Keyword arguments forwarded to the procedure's run() method.
+
+        Raises:
+            ProcedureError:      Server does not recognize the procedure name.
+            ConnectionLostError: Connection was lost before the ack arrived.
+
+        Examples:
+            proc = await lab.run_procedure("all_go_home")
+            await proc                                  # wait for completion
+            await proc.wait(timeout=120.0)              # wait with timeout
+            proc.cancel()                               # cancel mid-run
+        """
+        pending = await self._conn.run_procedure(name, args)
+        return ProcedureHandle(pending, self._conn)
 
     async def submit(self, devices: List[str], command: str, priority: int = 5, **args) -> CommandHandle:
         """

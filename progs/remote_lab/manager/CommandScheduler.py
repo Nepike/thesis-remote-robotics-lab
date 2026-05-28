@@ -148,7 +148,7 @@ class CommandScheduler:
         Cancel the command currently executing on a device.
 
         The worker will catch the cancellation, log it, and immediately pick up
-        the next command from the queue — so a high-priority command submitted
+        the next command from the queue - so a high-priority command submitted
         before this call will run next.
 
         Has no effect if the device is idle.
@@ -201,7 +201,7 @@ class CommandScheduler:
                         f"Skipping cancelled '{command.name}' on '{device_name}'",
                     )
                 else:
-                    # Run as a sub-task so it can be cancelled via interrupt_device()
+                    # Run as a sub-task so it can be canceled via interrupt_device()
                     # without cancelling the worker itself.
                     exec_task = asyncio.create_task(self._execute_callback(command, device_name))
                     self._current_exec_tasks[device_name] = exec_task
@@ -216,7 +216,7 @@ class CommandScheduler:
                                 f"Interrupted '{command.name}' on '{device_name}'",
                             )
                         else:
-                            # The worker task itself is being cancelled (shutdown).
+                            # The worker task itself is being canceled (shutdown).
                             # Cancel the sub-task too and propagate.
                             exec_task.cancel()
                             try:
