@@ -126,10 +126,6 @@ class RemoteLabManager:
         try:
             await driver.execute_command(command)
         finally:
-            # Always notify completion — even when the command was interrupted
-            # via interrupt_device() (CancelledError).  Without this the client's
-            # CommandHandle would hang forever waiting for a DoneMessage that
-            # is never sent.
             if self.on_command_complete:
                 try:
                     await self.on_command_complete(command, device_name)

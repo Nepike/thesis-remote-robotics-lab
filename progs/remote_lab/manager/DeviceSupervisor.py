@@ -22,7 +22,8 @@ class DeviceSupervisor:
             return self.transport_procs + self.adapter_procs
 
         def transports_alive(self) -> bool:
-            return bool(self.transport_procs) and all(p.returncode is None for p in self.transport_procs)
+            # Empty tuple means no transports required (well, device can be connected by wire ig) - counts as alive.
+            return not self.transport_procs or all(p.returncode is None for p in self.transport_procs)
 
         def adapters_alive(self) -> bool:
             # Empty tuple means no adapters required (e.g. SerialBasedDriver) - counts as alive.
