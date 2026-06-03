@@ -144,6 +144,9 @@ class Connection:
     _ACQUIRE_TIMEOUT: float = 1.0  # seconds to wait for ALREADY_OWNED error after acquire
 
     def __init__(self, url: str, username: str, password: str):
+        # Accept bare host[:port] or domain - add ws:// if no scheme given
+        if "://" not in url:
+            url = "ws://" + url
         self._url = url
         self._auth_header = {
             "Authorization": "Basic " + base64.b64encode(
@@ -211,7 +214,8 @@ class Connection:
 
     async def _open_ws(self):
         """Low-level: open the WebSocket (no reader task)."""
-        self._ws = await websockets.connect(self._url, extra_headers=self._auth_header)
+        url = self._url.rstrip("/") + "/ws"
+        self._ws = await websockets.connect(url, extra_headers=self._auth_header)
 
 
 

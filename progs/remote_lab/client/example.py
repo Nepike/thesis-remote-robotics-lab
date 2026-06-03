@@ -1,19 +1,3 @@
-"""
-RemoteLab — пример использования клиентской библиотеки.
-
-Запуск:
-    # Из корня проекта (рядом с папкой client/):
-    python client/example.py
-
-    # Или напрямую из client/:
-    cd client && python example.py
-
-Переменные окружения (опционально):
-    RL_URL       — адрес сервера (по умолчанию ws://localhost:8000)
-    RL_USER      — логин         (по умолчанию nepike)
-    RL_PASSWORD  — пароль        (по умолчанию нужно задать)
-"""
-
 import asyncio
 import os
 import sys
@@ -24,12 +8,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from client import RemoteLab, AcquireError, ConnectionLostError
 
 # ── Настройки подключения ──────────────────────────────────────────────────────
-SERVER_URL = os.environ.get("RL_URL",      "ws://localhost:8000")
-USERNAME   = os.environ.get("RL_USER",     "nepike")
-PASSWORD   = os.environ.get("RL_PASSWORD", "CHANGE_ME")
+SERVER_URL = os.environ.get("RL_URL",      "localhost:8000")
+USERNAME   = os.environ.get("RL_USER",     "test")
+PASSWORD   = os.environ.get("RL_PASSWORD", "1234")
 
 
-# ── Телеметрия-коллбек ────────────────────────────────────────────────────────
 def on_telemetry(data: dict):
     print(
         f"  [telemetry]  "
@@ -39,7 +22,6 @@ def on_telemetry(data: dict):
     )
 
 
-# ── Основной сценарий ─────────────────────────────────────────────────────────
 async def main():
     print(f"Connecting to {SERVER_URL} as '{USERNAME}'...")
 
@@ -70,7 +52,7 @@ async def main():
             await robot.unsubscribe_telemetry()
             print()
 
-            # 3. Команды — нужен exclusive lock (если устройство не shared)
+            # 3. Команды - нужен exclusive lock (если устройство не shared)
             is_shared = devices[0]["shared"]
             if is_shared:
                 # shared-устройства не требуют acquire
@@ -83,7 +65,7 @@ async def main():
                     print("Lock released.")
                 except AcquireError as e:
                     print(f"Could not acquire lock: {e}")
-                    print("(Another client may be using the device — try again later.)")
+                    print("(Another client may be using the device - try again later.)")
 
     except ConnectionLostError as e:
         print(f"\nConnection lost: {e}")
@@ -97,7 +79,7 @@ async def main():
 async def _run_commands(robot):
     print("\n--- Sending commands ---")
 
-    # Бип 0.3 с — ждём завершения
+    # Бип 0.3 с - ждём завершения
     print("beep (0.3s)...")
     cmd = await robot.submit("beep", priority=5, duration=0.3)
     await cmd
@@ -105,7 +87,7 @@ async def _run_commands(robot):
 
     await asyncio.sleep(0.5)
 
-    # Движение вперёд 1 с — ждём
+    # Движение вперёд 1 с - ждём
     print("move forward (1.0s)...")
     cmd = await robot.submit("move", priority=5, speed_lin=0.4, speed_ang=0.0, duration=1.0)
     await cmd
