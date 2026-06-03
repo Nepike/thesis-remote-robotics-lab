@@ -291,6 +291,12 @@ class Yarp13Driver(RosBasedDriver):
             self._on_sensors_msg,
         )
 
+    async def teardown_telemetry(self):
+        if self._device.ros_namespace:
+            self._ros.unsubscribe(
+                f"/{self._device.ros_namespace.strip('/')}/yy_sensors"
+            )
+
     async def _on_sensors_msg(self, msg):
         telemetry = Yarp13Telemetry(
             enc_left=msg.enc_left,
