@@ -1,25 +1,21 @@
 import asyncio
 import os
 import sys
+from contextlib import AsyncExitStack
 
 # Поддержка запуска как из корня проекта, так и из папки client/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from client import RemoteLab, AcquireError, ConnectionLostError
 
-# ── Настройки подключения ──────────────────────────────────────────────────────
-SERVER_URL = os.environ.get("RL_URL",      "localhost:8000")
-USERNAME   = os.environ.get("RL_USER",     "test")
-PASSWORD   = os.environ.get("RL_PASSWORD", "1234")
+# Настройки подключения
+SERVER_URL = "localhost:8000"
+USERNAME   = "test"
+PASSWORD   = "1234"
 
 
 def on_telemetry(data: dict):
-    print(
-        f"  [telemetry]  "
-        f"enc_l={data.get('enc_left', '?'):6}  enc_r={data.get('enc_right', '?'):6}  "
-        f"spd_l={data.get('speed_left', '?'):4}  spd_r={data.get('speed_right', '?'):4}  "
-        f"U={data.get('acc_voltage', '?'):.2f}V"
-    )
+    print(data)
 
 
 async def main():
@@ -29,7 +25,6 @@ async def main():
         async with RemoteLab(SERVER_URL, USERNAME, PASSWORD) as lab:
             print("Connected.\n")
 
-            # 1. Список устройств
             devices = await lab.get_devices()
             print(f"Active devices ({len(devices)}):")
             for d in devices:
@@ -38,69 +33,52 @@ async def main():
             print()
 
             if not devices:
-                print("No active devices. Check devices.json on the server.")
+                print("No active devices.")
                 return
 
-            device_name = devices[0]["name"]
-            robot = lab.device(device_name)
-            print(f"Using device: '{device_name}'\n")
+            device_names = [d["name"] for d in devices]
 
-            # 2. Телеметрия (подписываемся до команд, чтобы сразу видеть данные)
-            print("Subscribing to telemetry (5 seconds)...")
-            await robot.subscribe_telemetry(on_telemetry)
-            await asyncio.sleep(5)
-            await robot.unsubscribe_telemetry()
-            print()
+            # Телеметрия с первого робота — просто чтобы наблюдать поток
+            await lab.device(devices[0]["name"]).subscribe_telemetry(on_telemetry)
 
-            # 3. Команды - нужен exclusive lock (если устройство не shared)
-            is_shared = devices[0]["shared"]
-            if is_shared:
-                # shared-устройства не требуют acquire
-                await _run_commands(robot)
-            else:
-                try:
-                    async with robot.lock():
-                        print("Lock acquired.")
-                        await _run_commands(robot)
-                    print("Lock released.")
-                except AcquireError as e:
-                    print(f"Could not acquire lock: {e}")
-                    print("(Another client may be using the device - try again later.)")
+            # Захватываем только эксклюзивные устройства (shared не требуют lock)
+            async with AsyncExitStack() as stack:
+                for d in devices:
+                    if not d["shared"]:
+                        await stack.enter_async_context(lab.device(d["name"]).lock())
 
+                # 1. Все роботы пищат 1 секунду
+                print("group beep (1s)...")
+                cmd = await lab.submit(device_names, "beep", priority=5, duration=1.0)
+                await cmd
+
+                # 2. Все крутятся влево на месте
+                print("group spin LEFT (2s)...")
+                cmd = await lab.submit(
+                    device_names, "move", priority=5,
+                    speed_lin=0.0, speed_ang=1.0, duration=4.0,
+                )
+                await cmd
+
+                # 3. Все крутятся вправо на месте
+                print("group spin RIGHT (2s)...")
+                cmd = await lab.submit(
+                    device_names, "move", priority=5,
+                    speed_lin=0.0, speed_ang=-1.0, duration=4.0,
+                )
+                await cmd
+
+                print("done.")
+
+    except AcquireError as e:
+        print(f"Could not acquire a device: {e}")
+        sys.exit(1)
     except ConnectionLostError as e:
         print(f"\nConnection lost: {e}")
         sys.exit(1)
     except OSError as e:
         print(f"\nCould not connect to server ({SERVER_URL}): {e}")
-        print("Make sure the server is running and the address is correct.")
         sys.exit(1)
-
-
-async def _run_commands(robot):
-    print("\n--- Sending commands ---")
-
-    # Бип 0.3 с - ждём завершения
-    print("beep (0.3s)...")
-    cmd = await robot.submit("beep", priority=5, duration=0.3)
-    await cmd
-    print("  done.")
-
-    await asyncio.sleep(0.5)
-
-    # Движение вперёд 1 с - ждём
-    print("move forward (1.0s)...")
-    cmd = await robot.submit("move", priority=5, speed_lin=0.4, speed_ang=0.0, duration=1.0)
-    await cmd
-    print("  done.")
-
-    await asyncio.sleep(0.3)
-
-    # Стоп (мгновенно)
-    print("stop...")
-    await robot.submit("stop", priority=999)
-    print("  sent.")
-
-    print("--- Done ---\n")
 
 
 if __name__ == "__main__":

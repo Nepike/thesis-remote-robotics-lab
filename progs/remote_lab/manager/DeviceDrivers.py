@@ -31,6 +31,10 @@ class AbstractDriver(ABC):
         # For pull-telemetry
         self._latest_telemetry: Optional[Any] = None
 
+        # True once telemetry has started flowing — i.e. the physical device is
+        # actually connected and talking. Reset on teardown so a reconnect re-logs.
+        self._online: bool = False
+
         #  When a new message arrives from the device, all the functions are called.
         self._telemetry_listeners: Dict[int, Callable[[Any], Awaitable[None]]] = {}
 
@@ -84,7 +88,9 @@ class AbstractDriver(ABC):
 
     async def teardown_telemetry(self):
         """Unsubscribe / close telemetry connections. Called before processes are stopped."""
-        pass
+        # Mark offline so the next successful connection re-logs the 'online' event.
+        # Subclasses that override this must call super().teardown_telemetry().
+        self._online = False
 
     def get_telemetry(self) -> Optional[Any]:
         """Return the latest received telemetry snapshot, or None if nothing has arrived yet."""
@@ -101,6 +107,11 @@ class AbstractDriver(ABC):
         self._telemetry_listeners.pop(listener_id, None)
 
     async def _notify_listeners(self, telemetry: Any):
+        # First telemetry after (re)connect means the device is actually online and talking.
+        if not self._online:
+            self._online = True
+            await Logger.get().log("DEVICE", f"'{self._device.name}' online")
+
         # It iterates over a copy of the dictionary because the listener could theoretically remove itself during the call
         for callback in list(self._telemetry_listeners.values()):
             await callback(telemetry)
@@ -292,6 +303,7 @@ class Yarp13Driver(RosBasedDriver):
         )
 
     async def teardown_telemetry(self):
+        await super().teardown_telemetry()
         if self._device.ros_namespace:
             self._ros.unsubscribe(
                 f"/{self._device.ros_namespace.strip('/')}/yy_sensors"
@@ -450,6 +462,7 @@ class SimpleSerialDevice(SerialBasedDriver):
         self._serial.subscribe_async(self._transport_path, self._on_line)
 
     async def teardown_telemetry(self):
+        await super().teardown_telemetry()
         await self._serial.close(self._transport_path)
 
     async def _on_line(self, line: bytes):

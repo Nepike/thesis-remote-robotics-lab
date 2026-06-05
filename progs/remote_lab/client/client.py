@@ -145,6 +145,8 @@ class DeviceProxy:
     The same proxy object is returned on repeated calls with the same name.
     """
 
+    # sorry for protected accesses :(
+
     def __init__(self, lab: "RemoteLab", name: str):
         self._lab  = lab
         self._name = name
