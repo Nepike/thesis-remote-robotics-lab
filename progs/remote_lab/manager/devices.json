@@ -4,7 +4,7 @@
     "ip": "192.168.0.102",
     "port": 2000,
     "driver": "yarp13",
-    "ros_namespace": "robot1/test-device",
+    "ros_namespace": "robot1/test_device",
     "shared": true,
     "active": true
   },
