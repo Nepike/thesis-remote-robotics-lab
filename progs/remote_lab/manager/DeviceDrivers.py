@@ -302,17 +302,46 @@ class Yarp13Driver(RosBasedDriver):
         "set_klpf": 2,
     }
 
-    # One-shot commands can be lost or corrupted on the (flaky) serial link, and a
-    # single drop swallows the whole command. Sending each command a few times
-    # back-to-back makes a transient drop far less likely to lose it entirely.
-    # Especially important for the stop/off messages in `finally` blocks (safety).
-    _CMD_REPEAT: int = 3
+    # --- Reliable delivery over a lossy rosserial link --------------------------
+    # The serial/rosserial link to the device drops ~20% of one-shot frames (even
+    # with the firmware spinOnce fix), so a command sent ONCE is unreliable — and a
+    # lost stop = a robot that does not stop.  Instead of sending edge commands we
+    # STREAM the desired setpoint at _STREAM_HZ: a dropped frame is corrected by the
+    # next one ~100 ms later (this is how cmd_vel is normally driven).  Motion stop
+    # is streamed for a short tail in the BACKGROUND so it survives even if the
+    # command coroutine is cancelled (E-stop).
+    _STREAM_HZ:   float = 10.0   # setpoint streaming rate, Hz
+    _ONESHOT_S:   float = 0.3    # how long to stream a one-shot command (~3 frames)
+    _STOP_TAIL_S: float = 0.6    # how long to keep streaming stop after motion ends
 
-    def _publish_repeated(self, topic, msg_type, message, times: Optional[int] = None):
-        """Publish the same command several times (see _CMD_REPEAT) for robustness."""
-        n = self._CMD_REPEAT if times is None else times
+    def __init__(self, device: Device, ros: RosInterface):
+        super().__init__(device, ros)
+        # Background task that keeps streaming the latest stop/off value.
+        self._tail_task: Optional[asyncio.Task] = None
+
+    async def _stream(self, topic: str, msg_type, message, duration: float):
+        """Publish `message` at _STREAM_HZ for `duration` seconds (at least once)."""
+        period = 1.0 / self._STREAM_HZ
+        n = max(1, int(round(duration / period)))
         for _ in range(n):
             self._ros.publish(topic, msg_type, message)
+            await asyncio.sleep(period)
+
+    def _cancel_tail(self):
+        if self._tail_task is not None and not self._tail_task.done():
+            self._tail_task.cancel()
+        self._tail_task = None
+
+    def _start_tail(self, topic: str, msg_type, message):
+        """
+        Stream a stop/off value in the BACKGROUND for _STOP_TAIL_S seconds.
+        Fire-and-forget so it completes even when the owning command coroutine is
+        cancelled (interrupt / E-stop). Replaces any previous tail.
+        """
+        self._cancel_tail()
+        self._tail_task = asyncio.create_task(
+            self._stream(topic, msg_type, message, self._STOP_TAIL_S)
+        )
 
     async def setup_publishers(self):
         ns = self._device.ros_namespace.strip("/")
@@ -373,110 +402,108 @@ class Yarp13Driver(RosBasedDriver):
         await self._notify_listeners(telemetry)
 
     async def execute_command(self, command: Command):
-        ns = self._device.ros_namespace.strip("/")
-        a  = command.args or {}
+        ns      = self._device.ros_namespace.strip("/")
+        a       = command.args or {}
+        cmd_vel = f"/{ns}/cmd_vel"
+        yy_cmd  = f"/{ns}/yy_command"
+        Twist   = geometry_msgs.msg.Twist
+        Cmd     = msg_yy.msg.cmd
+
+        # Any new command supersedes a still-running stop/off tail from a previous one.
+        self._cancel_tail()
 
         if command.name == "move":
-            # Publish velocity and hold for `duration` seconds.
-            # On interrupt (CancelledError), the finally block sends a stop before propagating.
-            twist = geometry_msgs.msg.Twist()
+            # Stream the velocity setpoint for `duration`; on completion or interrupt,
+            # stream a stop tail in the background (survives E-stop). Robust to frame loss.
+            twist = Twist()
             twist.linear.x  = float(a.get("speed_lin", 0.0))
             twist.angular.z = float(a.get("speed_ang", 0.0))
-            self._publish_repeated(f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, twist)
             try:
-                await asyncio.sleep(float(a.get("duration", 0.0)))
+                await self._stream(cmd_vel, Twist, twist, float(a.get("duration", 0.0)))
             finally:
-                self._publish_repeated(
-                    f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, geometry_msgs.msg.Twist()
-                )
+                self._start_tail(cmd_vel, Twist, Twist())
 
         elif command.name == "stop":
-            # Zero Twist stops both motors regardless of current control mode.
-            self._publish_repeated(
-                f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, geometry_msgs.msg.Twist()
-            )
+            # Stream zero Twist for the stop tail — reliably halts the robot.
+            await self._stream(cmd_vel, Twist, Twist(), self._STOP_TAIL_S)
 
         elif command.name in ("dctl", "pidctl"):
             # Direct PWM or PID wheel speed.  arg: w_l, w_r in [-255, +255], optional duration.
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("w_l", 0.0)), float(a.get("w_r", 0.0))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            stop = Cmd()
+            stop.command = self._CMD[command.name]
+            stop.arg     = [0.0, 0.0]
             try:
-                await asyncio.sleep(float(a.get("duration", 0.0)))
+                await self._stream(yy_cmd, Cmd, yy, float(a.get("duration", 0.0)))
             finally:
-                stop = msg_yy.msg.cmd()
-                stop.command = self._CMD[command.name]
-                stop.arg     = [0.0, 0.0]
-                self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, stop)
-
-        elif command.name in ("beep_on", "beep_off", "gun_on", "gun_off", "compass_calibr"):
-            # Instantaneous toggle commands — no duration.
-            yy = msg_yy.msg.cmd()
-            yy.command = self._CMD[command.name]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+                self._start_tail(yy_cmd, Cmd, stop)
 
         elif command.name == "beep":
-            # Convenience: beep_on → sleep → beep_off.  arg: duration (seconds).
-            on = msg_yy.msg.cmd()
-            on.command = self._CMD["beep_on"]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, on)
+            # Stream beep_on for `duration`, then stream beep_off as the tail.
+            on = Cmd();  on.command  = self._CMD["beep_on"]
+            off = Cmd(); off.command = self._CMD["beep_off"]
             try:
-                await asyncio.sleep(float(a.get("duration", 0.5)))
+                await self._stream(yy_cmd, Cmd, on, float(a.get("duration", 0.5)))
             finally:
-                off = msg_yy.msg.cmd()
-                off.command = self._CMD["beep_off"]
-                self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, off)
+                self._start_tail(yy_cmd, Cmd, off)
+
+        elif command.name in ("beep_on", "beep_off", "gun_on", "gun_off", "compass_calibr"):
+            # One-shot toggle — stream a short burst so a dropped frame doesn't lose it.
+            yy = Cmd()
+            yy.command = self._CMD[command.name]
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name == "set_servo":
             # arg: a0, a1, a2 — angles in degrees for each of the 3 servos.
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD["set_servo"]
             yy.angle   = [int(a.get("a0", 90)), int(a.get("a1", 90)), int(a.get("a2", 90))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name in ("set_pid", "set_pid_left", "set_pid_right"):
             # arg: kp, ki, kd
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("kp", 0.5)), float(a.get("ki", 0.02)), float(a.get("kd", 0.2))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name == "set_enc":
             # arg: left, right — reset encoder counters to these values.
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD["set_enc"]
             yy.arg     = [float(a.get("left", 0)), float(a.get("right", 0))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name == "set_refl_dist":
             # arg: center, left, right — obstacle reflex distances in cm.
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD["set_refl_dist"]
             yy.arg     = [float(a.get("center", 20)), float(a.get("left", 20)), float(a.get("right", 20))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name == "set_motors_ratio":
             # arg: left, right — scaling factors to balance drive motors.
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD["set_motors_ratio"]
             yy.arg     = [float(a.get("left", 1.0)), float(a.get("right", 1.0))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name == "set_calibr_speed":
             # arg: speed (PWM during calibration spin), max_cnt (number of ticks).
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD["set_calibr_speed"]
             yy.arg     = [float(a.get("speed", 40)), float(a.get("max_cnt", 600))]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         elif command.name == "set_klpf":
             # arg: k — low-pass filter coefficient for drive speed (0..1).
-            yy = msg_yy.msg.cmd()
+            yy = Cmd()
             yy.command = self._CMD["usr"]
             yy.arg     = [float(a.get("k", 1.0))]
             yy.da      = [self._SUBCMD["set_klpf"], 0, 0, 0]
-            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
 
         else:
             raise ValueError(f"Unknown command '{command.name}' for Yarp13Driver")

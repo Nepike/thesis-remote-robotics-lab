@@ -1,10 +1,19 @@
 [
   {
-    "name": "Test-device",
+    "name": "Test-device-1",
     "ip": "192.168.0.102",
     "port": 2000,
     "driver": "yarp13",
-    "ros_namespace": "robot1/test_device",
+    "ros_namespace": "robot1/test_device_111",
+    "shared": true,
+    "active": true
+  },
+  {
+    "name": "Test-device-2",
+    "ip": "192.168.0.103",
+    "port": 2000,
+    "driver": "yarp13",
+    "ros_namespace": "robot2/test_device_222",
     "shared": true,
     "active": true
   },
@@ -18,4 +27,3 @@
     "active": false
   }
 ]
-
