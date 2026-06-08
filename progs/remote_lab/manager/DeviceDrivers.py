@@ -86,6 +86,17 @@ class AbstractDriver(ABC):
         """Subscribe to device telemetry sources. Called after adapters are started."""
         pass
 
+    async def setup_publishers(self):
+        """
+        Pre-create (warm up) command publishers and wait for their subscribers to
+        connect. Called after setup_telemetry, on every (re)start of the device.
+
+        Removes the rospy create+publish race: without warm-up, the first command
+        after startup / after a device restart is published before the publisher-
+        subscriber connection is established and is silently lost.
+        """
+        pass
+
     async def teardown_telemetry(self):
         """Unsubscribe / close telemetry connections. Called before processes are stopped."""
         # Mark offline so the next successful connection re-logs the 'online' event.
@@ -291,6 +302,31 @@ class Yarp13Driver(RosBasedDriver):
         "set_klpf": 2,
     }
 
+    # One-shot commands can be lost or corrupted on the (flaky) serial link, and a
+    # single drop swallows the whole command. Sending each command a few times
+    # back-to-back makes a transient drop far less likely to lose it entirely.
+    # Especially important for the stop/off messages in `finally` blocks (safety).
+    _CMD_REPEAT: int = 3
+
+    def _publish_repeated(self, topic, msg_type, message, times: Optional[int] = None):
+        """Publish the same command several times (see _CMD_REPEAT) for robustness."""
+        n = self._CMD_REPEAT if times is None else times
+        for _ in range(n):
+            self._ros.publish(topic, msg_type, message)
+
+    async def setup_publishers(self):
+        ns = self._device.ros_namespace.strip("/")
+        # Create both command publishers ahead of any command and wait (best-effort,
+        # in parallel) for the rosserial subscriber to connect. Runs before the
+        # scheduler is resumed after a restart, so the first command after a device
+        # comes back isn't lost to the publisher-connection race.
+        self._ros.register_publisher(f"/{ns}/yy_command", msg_yy.msg.cmd)
+        self._ros.register_publisher(f"/{ns}/cmd_vel", geometry_msgs.msg.Twist)
+        await asyncio.gather(
+            self._ros.wait_for_publisher(f"/{ns}/yy_command", timeout=2.0),
+            self._ros.wait_for_publisher(f"/{ns}/cmd_vel", timeout=2.0),
+        )
+
     async def setup_telemetry(self):
         if not self._device.ros_namespace:
             raise RuntimeError(
@@ -346,17 +382,17 @@ class Yarp13Driver(RosBasedDriver):
             twist = geometry_msgs.msg.Twist()
             twist.linear.x  = float(a.get("speed_lin", 0.0))
             twist.angular.z = float(a.get("speed_ang", 0.0))
-            self._ros.publish(f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, twist)
+            self._publish_repeated(f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, twist)
             try:
                 await asyncio.sleep(float(a.get("duration", 0.0)))
             finally:
-                self._ros.publish(
+                self._publish_repeated(
                     f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, geometry_msgs.msg.Twist()
                 )
 
         elif command.name == "stop":
             # Zero Twist stops both motors regardless of current control mode.
-            self._ros.publish(
+            self._publish_repeated(
                 f"/{ns}/cmd_vel", geometry_msgs.msg.Twist, geometry_msgs.msg.Twist()
             )
 
@@ -365,74 +401,74 @@ class Yarp13Driver(RosBasedDriver):
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("w_l", 0.0)), float(a.get("w_r", 0.0))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
             try:
                 await asyncio.sleep(float(a.get("duration", 0.0)))
             finally:
                 stop = msg_yy.msg.cmd()
                 stop.command = self._CMD[command.name]
                 stop.arg     = [0.0, 0.0]
-                self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, stop)
+                self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, stop)
 
         elif command.name in ("beep_on", "beep_off", "gun_on", "gun_off", "compass_calibr"):
             # Instantaneous toggle commands — no duration.
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD[command.name]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name == "beep":
             # Convenience: beep_on → sleep → beep_off.  arg: duration (seconds).
             on = msg_yy.msg.cmd()
             on.command = self._CMD["beep_on"]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, on)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, on)
             try:
                 await asyncio.sleep(float(a.get("duration", 0.5)))
             finally:
                 off = msg_yy.msg.cmd()
                 off.command = self._CMD["beep_off"]
-                self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, off)
+                self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, off)
 
         elif command.name == "set_servo":
             # arg: a0, a1, a2 — angles in degrees for each of the 3 servos.
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD["set_servo"]
             yy.angle   = [int(a.get("a0", 90)), int(a.get("a1", 90)), int(a.get("a2", 90))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name in ("set_pid", "set_pid_left", "set_pid_right"):
             # arg: kp, ki, kd
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("kp", 0.5)), float(a.get("ki", 0.02)), float(a.get("kd", 0.2))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name == "set_enc":
             # arg: left, right — reset encoder counters to these values.
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD["set_enc"]
             yy.arg     = [float(a.get("left", 0)), float(a.get("right", 0))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name == "set_refl_dist":
             # arg: center, left, right — obstacle reflex distances in cm.
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD["set_refl_dist"]
             yy.arg     = [float(a.get("center", 20)), float(a.get("left", 20)), float(a.get("right", 20))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name == "set_motors_ratio":
             # arg: left, right — scaling factors to balance drive motors.
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD["set_motors_ratio"]
             yy.arg     = [float(a.get("left", 1.0)), float(a.get("right", 1.0))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name == "set_calibr_speed":
             # arg: speed (PWM during calibration spin), max_cnt (number of ticks).
             yy = msg_yy.msg.cmd()
             yy.command = self._CMD["set_calibr_speed"]
             yy.arg     = [float(a.get("speed", 40)), float(a.get("max_cnt", 600))]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         elif command.name == "set_klpf":
             # arg: k — low-pass filter coefficient for drive speed (0..1).
@@ -440,7 +476,7 @@ class Yarp13Driver(RosBasedDriver):
             yy.command = self._CMD["usr"]
             yy.arg     = [float(a.get("k", 1.0))]
             yy.da      = [self._SUBCMD["set_klpf"], 0, 0, 0]
-            self._ros.publish(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
+            self._publish_repeated(f"/{ns}/yy_command", msg_yy.msg.cmd, yy)
 
         else:
             raise ValueError(f"Unknown command '{command.name}' for Yarp13Driver")

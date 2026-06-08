@@ -25,12 +25,47 @@ class RosInterface:
 
         rospy.loginfo("[RosInterface] initialized")
 
-    def publish(self, topic: str, msg_type: Type, message):
+    def register_publisher(self, topic: str, msg_type: Type) -> rospy.Publisher:
+        """
+        Create the publisher for a topic if it does not exist yet, WITHOUT sending
+        a message. Returns the publisher.
+
+        Used to pre-create (warm up) publishers ahead of the first command: rospy
+        establishes publisher-subscriber connections asynchronously, so a message
+        published in the same instant the publisher is created is silently dropped.
+        Creating the publisher early decouples creation from the first publish.
+        """
         with self._lock:
             if topic not in self._publishers:
                 self._publishers[topic] = rospy.Publisher(topic, msg_type, queue_size=10)
                 rospy.loginfo(f"[RosInterface] Publisher created: {topic}")
-            self._publishers[topic].publish(message)
+            return self._publishers[topic]
+
+    def publish(self, topic: str, msg_type: Type, message):
+        pub = self.register_publisher(topic, msg_type)
+        pub.publish(message)
+
+    async def wait_for_publisher(self, topic: str, timeout: float = 3.0, poll: float = 0.05) -> bool:
+        """
+        Wait (best-effort) until the publisher for `topic` has at least one
+        connected subscriber, or until `timeout` seconds elapse.
+
+        Returns True if a connection was established. Non-fatal: on timeout the
+        caller proceeds anyway (the publisher already exists, so a later command
+        will not hit the create+publish race).
+        """
+        with self._lock:
+            pub = self._publishers.get(topic)
+        if pub is None:
+            return False
+
+        waited = 0.0
+        while waited < timeout:
+            if pub.get_num_connections() > 0:
+                return True
+            await asyncio.sleep(poll)
+            waited += poll
+        return pub.get_num_connections() > 0
 
     def subscribe(self, topic: str, msg_type: Type, callback: Callable):
         """Subscribe with a synchronous callback (runs in rospy's thread)."""

@@ -52,6 +52,7 @@ class DeviceSupervisor:
         state.transport_procs = await state.driver.start_transports()
         state.adapter_procs = await state.driver.start_adapters()
         await state.driver.setup_telemetry()
+        await state.driver.setup_publishers()
         await logger.log("SUPERVISOR", f"'{device.name}' started")
 
     @staticmethod
@@ -117,6 +118,7 @@ class DeviceSupervisor:
             state.transport_procs = await state.driver.start_transports()
             state.adapter_procs = await state.driver.start_adapters()
             await state.driver.setup_telemetry()
+            await state.driver.setup_publishers()
 
             # Device is fully back - allow the command worker to continue
             if self.on_device_up:
