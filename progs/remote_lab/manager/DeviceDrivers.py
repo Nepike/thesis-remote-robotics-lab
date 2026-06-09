@@ -311,13 +311,22 @@ class Yarp13Driver(RosBasedDriver):
     _ONESHOT_S:   float = 0.3    # how long to stream a one-shot command (~3 frames)
     _STOP_TAIL_S: float = 0.6    # how long to keep streaming stop after motion ends
 
-    # Logical actuator channels that can have a running stop/off tail. A tail is
-    # cancelled ONLY by a new command that targets the SAME channel — the yy_command
-    # topic multiplexes many independent actuators (beep relay, gun, servos,
-    # encoders, PID, motors), so keying by topic would wrongly let e.g. set_enc
-    # cancel the beep-off tail. Keying by actuator avoids that.
-    _CH_DRIVE = "drive"   # motors (cmd_vel stop / dctl-pidctl stop)
-    _CH_BEEP  = "beep"    # beeper relay (beep_off)
+    # Each command targets one logical ACTUATOR CHANNEL. A command cancels the
+    # running stop/off tail ONLY on its own channel, so independent actuators that
+    # share the yy_command topic (beep relay, gun relay, servos, encoders, PID,
+    # motors, ...) never cancel each other's tails
+    #
+    # Only commands that share a channel with another command need listing here.
+    # Anything not listed is its own channel (its name) — inert, since only "held"
+    # commands (move/dctl/pidctl -> drive, beep -> beep) ever create a tail.
+    _CHANNEL: Dict[str, str] = {
+        "move": "drive", "stop": "drive", "dctl": "drive", "pidctl": "drive",
+        "beep": "beep",  "beep_on": "beep", "beep_off": "beep",
+        "gun_on": "gun", "gun_off": "gun",
+    }
+
+    def _channel_of(self, name: str) -> str:
+        return self._CHANNEL.get(name, name)
 
     def __init__(self, device: Device, ros: RosInterface):
         super().__init__(device, ros)
@@ -415,26 +424,29 @@ class Yarp13Driver(RosBasedDriver):
         Twist   = geometry_msgs.msg.Twist
         Cmd     = msg_yy.msg.cmd
 
+        # A new command overrides any running stop/off tail on its OWN actuator
+        # channel. Independent actuators never cancel each other: set_enc does not
+        # touch the beep tail, but a new beep / beep_on does.
+        channel = self._channel_of(command.name)
+        self._cancel_tail(channel)
+
         if command.name == "move":
             # Stream the velocity setpoint for `duration`; on completion or interrupt,
             # stream a stop tail in the background (survives E-stop). Robust to frame loss.
-            self._cancel_tail(self._CH_DRIVE)
             twist = Twist()
             twist.linear.x  = float(a.get("speed_lin", 0.0))
             twist.angular.z = float(a.get("speed_ang", 0.0))
             try:
                 await self._stream(cmd_vel, Twist, twist, float(a.get("duration", 0.0)))
             finally:
-                self._start_tail(self._CH_DRIVE, cmd_vel, Twist, Twist())
+                self._start_tail(channel, cmd_vel, Twist, Twist())
 
         elif command.name == "stop":
             # Stream zero Twist for the stop tail — reliably halts the robot.
-            self._cancel_tail(self._CH_DRIVE)
             await self._stream(cmd_vel, Twist, Twist(), self._STOP_TAIL_S)
 
         elif command.name in ("dctl", "pidctl"):
             # Direct PWM or PID wheel speed.  arg: w_l, w_r in [-255, +255], optional duration.
-            self._cancel_tail(self._CH_DRIVE)
             yy = Cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("w_l", 0.0)), float(a.get("w_r", 0.0))]
@@ -444,23 +456,21 @@ class Yarp13Driver(RosBasedDriver):
             try:
                 await self._stream(yy_cmd, Cmd, yy, float(a.get("duration", 0.0)))
             finally:
-                self._start_tail(self._CH_DRIVE, yy_cmd, Cmd, stop)
+                self._start_tail(channel, yy_cmd, Cmd, stop)
 
         elif command.name == "beep":
             # Stream beep_on for `duration`, then stream beep_off as the tail.
-            self._cancel_tail(self._CH_BEEP)
             on = Cmd();  on.command  = self._CMD["beep_on"]
             off = Cmd(); off.command = self._CMD["beep_off"]
             try:
                 await self._stream(yy_cmd, Cmd, on, float(a.get("duration", 0.5)))
             finally:
-                self._start_tail(self._CH_BEEP, yy_cmd, Cmd, off)
+                self._start_tail(channel, yy_cmd, Cmd, off)
 
         elif command.name in ("beep_on", "beep_off", "gun_on", "gun_off", "compass_calibr"):
             # One-shot toggle — stream a short burst so a dropped frame doesn't lose it.
-            # beep_on/off directly set the relay, so they cancel any running beep tail.
-            if command.name in ("beep_on", "beep_off"):
-                self._cancel_tail(self._CH_BEEP)
+            # Its channel's tail was already cancelled above (beep_on cancels a running
+            # beep-off tail; gun_on/off cancel the gun channel; compass_calibr is its own).
             yy = Cmd()
             yy.command = self._CMD[command.name]
             await self._stream(yy_cmd, Cmd, yy, self._ONESHOT_S)
