@@ -22,8 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
 import asyncio
+import json
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Callable, Optional
 
 import uvicorn
 from fastapi import FastAPI
@@ -36,6 +37,64 @@ from network.auth import init_user_store
 _BASE_DIR     = Path(__file__).parent.parent  # manager/
 _DEVICES_JSON = _BASE_DIR / "devices.json"
 _USERS_JSON   = _BASE_DIR / "users.json"
+
+
+# devices.json / users.json are gitignored (they hold per-deployment data that
+# must survive code updates). If they are absent on a fresh checkout, the server
+# writes these templates so the operator sees the expected schema, then stops
+# because an empty config has nothing to serve.
+_DEVICES_TEMPLATE = [
+    {
+        "name": "example-robot",
+        "ip": "192.168.0.100",
+        "port": 2000,
+        "driver": "yarp13",
+        "ros_namespace": "robot1/example",
+        "baud_rate": None,
+        "shared": True,
+        "active": False,
+    }
+]
+
+_USERS_TEMPLATE = {
+    "_note": "Manage users with: python network/auth.py register|delete|list"
+}
+
+
+def _devices_usable(data) -> bool:
+    """Usable once the config lists at least one ACTIVE device."""
+    return isinstance(data, list) and any(
+        isinstance(d, dict) and d.get("active") for d in data
+    )
+
+
+def _users_usable(data) -> bool:
+    """Usable once the config has at least one real (non-comment) user."""
+    return isinstance(data, dict) and any(not k.startswith("_") for k in data)
+
+
+def _ensure_config(path: Path, template, usable: Callable[[object], bool]) -> bool:
+    """
+    Create `path` from `template` if missing. Return True if the config is usable
+    (non-empty), False otherwise — missing-then-created, empty, or unreadable —
+    printing the reason in each case.
+    """
+    created = False
+    if not path.exists():
+        path.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        created = True
+        print(f"[server] Created template config: {path}")
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[server] Cannot read {path.name}: {e}")
+        return False
+
+    if not usable(data):
+        print(f"[server] {path.name} {'was just created and is empty' if created else 'is empty'}.")
+        return False
+    return True
 
 
 def _roscore_running(uri: str = "http://localhost:11311") -> bool:
@@ -86,10 +145,16 @@ async def lifespan(app: FastAPI):
     FastAPI guarantees the shutdown block runs even on SIGTERM.
     """
 
-    # Fail fast if config files are missing
-    for path in (_DEVICES_JSON, _USERS_JSON):
-        if not path.exists():
-            raise FileNotFoundError(f"Required config file not found: {path}")
+    # Bootstrap config: create templates if missing, and refuse to start on an
+    # empty configuration (no active devices / no users) — there would be nothing
+    # to serve. Both files are gitignored so deployment data survives code updates.
+    devices_ok = _ensure_config(_DEVICES_JSON, _DEVICES_TEMPLATE, _devices_usable)
+    users_ok   = _ensure_config(_USERS_JSON,   _USERS_TEMPLATE,   _users_usable)
+    if not (devices_ok and users_ok):
+        print("[server] Empty configuration — nothing to serve. Stopping.")
+        print(f"[server]   1. Add at least one active device to {_DEVICES_JSON.name}")
+        print(f"[server]   2. Register at least one user:  python network/auth.py register <username>")
+        raise RuntimeError("Empty configuration: fill devices.json and users.json, then restart.")
 
     # Start roscore before rospy.init_node() is called inside RemoteLabManager.__init__()
     roscore_proc = await _start_roscore()

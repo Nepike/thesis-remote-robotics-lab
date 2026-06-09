@@ -15,6 +15,14 @@ class Logger:
     def __init__(self):
         self._lock = asyncio.Lock()
         self._LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # The Logger is a process-wide singleton created once at server start, so
+        # wiping existing *.log files here means every server run begins with empty
+        # logs instead of endlessly appending across restarts.
+        for old_log in self._LOG_DIR.glob("*.log"):
+            try:
+                old_log.unlink()
+            except OSError:
+                pass
 
     @classmethod
     def get(cls) -> "Logger":

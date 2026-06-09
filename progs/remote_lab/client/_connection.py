@@ -140,8 +140,7 @@ class Connection:
     """
 
     _RETRY_DELAYS: List[float] = [1.0, 2.0, 4.0]  # backoff between reconnect attempts
-    _ACK_TIMEOUT:  float = 5.0   # seconds to wait for server ack after submit / get_devices
-    _ACQUIRE_TIMEOUT: float = 1.0  # seconds to wait for ALREADY_OWNED error after acquire
+    _ACK_TIMEOUT:  float = 5.0   # seconds to wait for a server response (ack / acquire_ok / devices)
 
     def __init__(self, url: str, username: str, password: str):
         # Accept bare host[:port] or domain - add ws:// if no scheme given
@@ -267,6 +266,12 @@ class Connection:
                     log.exception(
                         "RemoteLab: telemetry callback for '%s' raised", device
                     )
+
+        elif t == "acquire_ok":
+            # Explicit success for the in-flight acquire (no more timeout-as-success).
+            if self._pending_acquire_event:
+                self._pending_acquire_error = None
+                self._pending_acquire_event.set()
 
         elif t == "devices":
             if self._devices_future and not self._devices_future.done():
@@ -400,9 +405,11 @@ class Connection:
         """
         Acquire exclusive access to a device.
 
-        On success: returns normally (server sends no ack - silence = success).
+        The server always answers: acquire_ok on success, ALREADY_OWNED on failure.
+        Shared devices always succeed.
+
+        On success: returns normally.
         On failure: raises AcquireError.
-        No-op for shared devices (server always succeeds, no error sent).
         """
         async with self._acquire_lock:
             self._pending_acquire_event = asyncio.Event()
@@ -411,14 +418,15 @@ class Connection:
             await self._send({"type": "acquire", "device": device})
 
             try:
-                # Wait briefly for an ALREADY_OWNED error.  Timeout = success.
-                await asyncio.wait_for(self._pending_acquire_event.wait(),timeout=self._ACQUIRE_TIMEOUT)
-                # Event fired before timeout -> server sent ALREADY_OWNED
-                raise AcquireError(self._pending_acquire_error or f"Failed to acquire '{device}'")
+                await asyncio.wait_for(self._pending_acquire_event.wait(), timeout=self._ACK_TIMEOUT)
             except asyncio.TimeoutError:
-                self._acquired_devices.add(device)
+                raise AcquireError(f"No acquire response for '{device}' within {self._ACK_TIMEOUT}s")
             finally:
                 self._pending_acquire_event = None
+
+            if self._pending_acquire_error is not None:
+                raise AcquireError(self._pending_acquire_error)
+            self._acquired_devices.add(device)
 
     async def release(self, device: str):
         """Release exclusive access to a device."""

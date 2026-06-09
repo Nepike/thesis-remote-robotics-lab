@@ -10,7 +10,7 @@ from DeviceDrivers import AbstractDriver, DriverFactory
 from DeviceSupervisor import DeviceSupervisor
 from HardwareInterfaces import RosInterface, SerialInterface
 from Logger import Logger
-from Procedures import AllGoHome, StopAll, ProcedureManager
+from Procedures import AllGoHome, StopAll, SyncTest, ProcedureManager
 
 
 class RemoteLabManager:
@@ -38,6 +38,10 @@ class RemoteLabManager:
         self._scheduler          = CommandScheduler(self._on_execute_command)
         self._access_controller  = AccessController()
 
+        # Release server-side waiters even for commands that never execute
+        # (skipped because cancelled). See submit_command_wait / _on_command_settled.
+        self._scheduler.on_command_settled = self._on_command_settled
+
         # device_name -> driver / Device (populated by load_config)
         self._drivers: Dict[str, AbstractDriver] = {}
         self._devices: Dict[str, Device]         = {}
@@ -49,6 +53,7 @@ class RemoteLabManager:
         self._procedure_manager = ProcedureManager(self)
         self._procedure_manager.register(StopAll())
         self._procedure_manager.register(AllGoHome())
+        self._procedure_manager.register(SyncTest())
 
         # Wired by the network layer after startup.
         # Called with (command, device_name) after every execute_command() returns.
@@ -132,17 +137,35 @@ class RemoteLabManager:
                 except Exception:
                     pass  # don't mask CancelledError or the driver exception
 
-            # Unblock any procedure that is awaiting this command's completion.
-            waiter = self._command_waiters.get(command.command_id)
-            if waiter:
-                event, remaining = waiter
-                remaining -= 1
-                if remaining <= 0:
-                    self._command_waiters.pop(command.command_id, None)
-                    event.set()
-                else:
-                    self._command_waiters[command.command_id] = (event, remaining)
+    def _on_command_settled(self, command: Command, device_name: str):
+        """
+        Called by the scheduler once per (command, device) when the command leaves
+        the queue for good — executed, skipped (cancelled), or errored alike.
 
+        Unblocks any procedure awaiting this command in submit_command_wait().
+        Because settlement fires even for skipped commands, a cancelled command no
+        longer leaves submit_command_wait() hanging forever.
+        """
+        waiter = self._command_waiters.get(command.command_id)
+        if not waiter:
+            return
+        event, remaining = waiter
+        remaining -= 1
+        if remaining <= 0:
+            self._command_waiters.pop(command.command_id, None)
+            event.set()
+        else:
+            self._command_waiters[command.command_id] = (event, remaining)
+
+
+    def _check_access(self, client_id: str, devices: List[str]):
+        """Raise PermissionError if the client cannot command any of the devices."""
+        for device_name in devices:
+            if not self._access_controller.check_access(device_name, client_id):
+                raise PermissionError(
+                    f"Client '{client_id}' does not have access to '{device_name}'. "
+                    f"Call acquire_device() first."
+                )
 
     async def submit_command(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> str:
         """
@@ -151,25 +174,29 @@ class RemoteLabManager:
         Returns command_id. Raises PermissionError if the client does not have
         access to one or more of the requested devices.
         """
-        for device_name in devices:
-            if not self._access_controller.check_access(device_name, client_id):
-                raise PermissionError(
-                    f"Client '{client_id}' does not have access to '{device_name}'. "
-                    f"Call acquire_device() first."
-                )
-
+        self._check_access(client_id, devices)
         return await self._scheduler.submit(client_id, devices, command_name, priority, args)
 
     async def submit_command_wait(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None):
         """
-        Submit a command and block until all targeted devices finish executing it.
+        Submit a command and block until all targeted devices settle it.
 
         Intended for use inside procedures, where the procedure coroutine needs to
         know when a movement has physically completed before issuing the next one.
+
+        The waiter is registered BEFORE the command is enqueued, so it cannot be
+        missed by a worker that picks the command up immediately. It is released on
+        settlement (execute / skip / error), so a cancelled command won't hang here.
         """
-        command_id = await self.submit_command(client_id, devices, command_name, priority, args)
+        self._check_access(client_id, devices)
+        command = self._scheduler.make_command(client_id, devices, command_name, priority, args)
+
+        # Register the waiter synchronously (no await) before enqueue, so no worker
+        # can settle the command before we are listening.
         event = asyncio.Event()
-        self._command_waiters[command_id] = (event, len(devices))
+        self._command_waiters[command.command_id] = (event, len(devices))
+
+        await self._scheduler.enqueue(command)
         await event.wait()
 
     def acquire_device(self, device_name: str, client_id: str) -> bool:

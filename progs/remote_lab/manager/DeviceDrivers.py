@@ -384,6 +384,11 @@ class Yarp13Driver(RosBasedDriver):
 
     async def teardown_telemetry(self):
         await super().teardown_telemetry()
+        # Stop every background stop/off tail before the device goes away, so no
+        # lingering task keeps publishing (and silently re-creating publishers) on
+        # a ROS node that is restarting or shutting down.
+        for channel in list(self._tails):
+            self._cancel_tail(channel)
         if self._device.ros_namespace:
             self._ros.unsubscribe(
                 f"/{self._device.ros_namespace.strip('/')}/yy_sensors"

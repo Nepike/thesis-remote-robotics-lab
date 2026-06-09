@@ -1,5 +1,0 @@
-{
-  "_note": "Manage users with: python network/auth.py register|delete|list",
-  "nepike": "pbkdf2_sha256:260000:a4a274ca2a353b1aefd49675f9db51ff:259dbfdbcf01a1699e3511430624009672a4d05f03e86e2d1ad205b0ff3f8a0c",
-  "test": "pbkdf2_sha256:260000:004e6f927db097cf7e08c36b54df961f:e24efc4d5d13489b01d110f6b25f74f0967f80ca00a59fa1cee5e555fca80689"
-}

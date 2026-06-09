@@ -22,6 +22,12 @@ class CommandScheduler:
         """
         self._execute_callback = execute_callback
 
+        # Optional sync hook called exactly once per (command, device) as soon as
+        # the command leaves the device's queue for good — whether it executed,
+        # was skipped because it was cancelled, or errored. Lets the manager
+        # release server-side waiters even when a command never runs.
+        self.on_command_settled: Optional[Callable[[Command, str], None]] = None
+
         self._device_queues: Dict[str, asyncio.PriorityQueue] = {}
         self._workers: Dict[str, asyncio.Task] = {}
 
@@ -77,14 +83,14 @@ class CommandScheduler:
         self._workers.clear()
 
 
-    async def submit(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> str:
+    def make_command(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> Command:
         """
-        Enqueue a command for one or more devices.
+        Build a Command and register its tracking state WITHOUT enqueuing it yet.
 
-        The same Command object is placed in each device's queue, so all
-        targeted devices will eventually execute it independently.
-
-        Returns the command_id. Raises ValueError for unknown device names.
+        Split out from enqueue() so a caller that needs to wait on completion can
+        register its waiter (keyed by command_id) BEFORE any worker can possibly
+        pick the command up — closing the race where a fast command settles before
+        the waiter exists. Raises ValueError for unknown device names.
         """
         unknown = [d for d in devices if d not in self._device_queues]
         if unknown:
@@ -100,10 +106,24 @@ class CommandScheduler:
 
         self._pending_counts[command.command_id] = len(devices)
         self._client_commands[client_id].add(command.command_id)
+        return command
 
-        for device_name in devices:
+    async def enqueue(self, command: Command):
+        """Place an already-built command into every targeted device's queue."""
+        for device_name in command.devices:
             await self._device_queues[device_name].put(command)
 
+    async def submit(self, client_id: str, devices: List[str], command_name: str, priority: int, args: Optional[dict] = None) -> str:
+        """
+        Enqueue a command for one or more devices.
+
+        The same Command object is placed in each device's queue, so all
+        targeted devices will eventually execute it independently.
+
+        Returns the command_id. Raises ValueError for unknown device names.
+        """
+        command = self.make_command(client_id, devices, command_name, priority, args)
+        await self.enqueue(command)
         return command.command_id
 
 
@@ -239,6 +259,10 @@ class CommandScheduler:
             finally:
                 queue.task_done()
                 self._on_command_done(command)
+                # Settle the command for external waiters (manager), regardless of
+                # whether it executed, was skipped (cancelled), or errored.
+                if self.on_command_settled:
+                    self.on_command_settled(command, device_name)
 
     def _on_command_done(self, command: Command):
         """

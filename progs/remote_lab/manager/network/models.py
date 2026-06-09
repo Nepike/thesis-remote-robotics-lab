@@ -144,6 +144,17 @@ class TelemetryMessage(BaseModel):
     data: Dict[str, Any]
 
 
+class AcquireOkMessage(BaseModel):
+    """
+    Explicit success response to an acquire request.
+
+    Sent so the client doesn't have to infer success from a timeout ("silence =
+    success"). Paired with ErrorMessage(code="ALREADY_OWNED") for the failure case.
+    """
+    type: Literal["acquire_ok"] = "acquire_ok"
+    device: str
+
+
 class DeviceInfo(BaseModel):
     """Lightweight device descriptor sent to clients."""
     name: str

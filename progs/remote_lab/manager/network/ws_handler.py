@@ -25,6 +25,7 @@ from network.auth import verify_credentials
 from network.models import (
     AckMessage,
     AcquireMessage,
+    AcquireOkMessage,
     CancelMessage,
     CancelProcedureMessage,
     DeviceInfo,
@@ -139,8 +140,23 @@ class ConnectionManager:
         self._sessions[client_id] = session
         return session
 
-    def disconnect(self, client_id: str) -> None:
-        self._sessions.pop(client_id, None)
+    def disconnect(self, session: "ClientSession") -> bool:
+        """
+        Remove a session, but ONLY if it is still the active one for its user.
+
+        A reconnect under the same username creates a second session (B) and
+        closes the first (A).  When A's receive loop finally unwinds, it must not
+        evict B from the registry, nor trigger user-level cleanup that would drop
+        B's device locks / queued commands.  The identity check makes A's teardown
+        a no-op once it has been replaced.
+
+        Returns True if this session was the active one (caller should then run
+        user-level cleanup), False if it had already been superseded.
+        """
+        if self._sessions.get(session.client_id) is session:
+            del self._sessions[session.client_id]
+            return True
+        return False
 
     def register_command(self, command_id: str, client_id: str, num_devices: int) -> None:
         """
@@ -225,7 +241,9 @@ async def _handle_submit(session: ClientSession, msg: SubmitMessage) -> None:
 
 async def _handle_acquire(session: ClientSession, msg: AcquireMessage) -> None:
     ok = _manager.acquire_device(msg.device, session.client_id)
-    if not ok:
+    if ok:
+        await session.send(AcquireOkMessage(device=msg.device))
+    else:
         await session.send(ErrorMessage(
             code="ALREADY_OWNED",
             message=f"Device '{msg.device}' is already owned by another client.",
@@ -362,7 +380,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        # Always runs - even on unexpected disconnects or exceptions above
+        # Always runs - even on unexpected disconnects or exceptions above.
+        # Removing our own telemetry listeners is always safe (they are keyed by
+        # listener id unique to this session). But user-level cleanup (releasing
+        # device locks, cancelling queued commands) must run ONLY if this session
+        # is still the active one — otherwise a reconnect that already replaced us
+        # would have its locks/commands wiped by the old socket's teardown.
         session.unsubscribe_all_telemetry()
-        _manager.on_client_disconnect(client_id)
-        _conn_manager.disconnect(client_id)
+        if _conn_manager.disconnect(session):
+            _manager.on_client_disconnect(client_id)

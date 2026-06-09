@@ -1,6 +1,11 @@
 /**/__pycache__
 /logs/
 /config.yml
+
+# Per-deployment data — created from templates on first server start.
+# Kept out of git so updating code never wipes registered users/devices.
+/devices.json
+/users.json
 /.idea/*
 /.venv/*
 /.virtualenv/*

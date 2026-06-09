@@ -91,6 +91,116 @@ class AllGoHome(AbstractProcedure):
         #           manager.release_device(name, client_id)
 
 
+class SyncTest(AbstractProcedure):
+    """
+    Group synchronization self-test for the whole active fleet.
+
+    Drives every reachable robot through an identical sequence at the same time
+    and verifies that each one is streaming live telemetry. Useful as a one-shot
+    "is the lab healthy?" check before a session.
+
+    Sequence (each phase is submitted to ALL devices at once and awaited, so the
+    fleet stays in lockstep):
+        1. beep for _BEEP_S seconds
+        2. spin in place LEFT  for _SPIN_S seconds
+        3. spin in place RIGHT for _SPIN_S seconds
+        4. verify telemetry is flowing from every device
+
+    Telemetry liveness: the driver keeps the latest sensor snapshot in
+    get_telemetry() independently of any client subscription. We sample it,
+    wait a short window, and sample again — a fresh snapshot object means new
+    messages are arriving. If any device is silent, the procedure raises, so the
+    caller receives a procedure_error naming the dead robots.
+
+    Possible extensions: assert pwm_left/right != 0 during the spin phases to
+    confirm the motion command actually reached the firmware, or compare encoder
+    deltas to confirm the wheels turned.
+    """
+
+    name = "sync_test"
+
+    _PRIORITY:    int   = 10    # above the default 5, so the test isn't starved
+    _BEEP_S:      float = 1.0
+    _SPIN_S:      float = 3.0
+    _SPIN_SPEED:  float = 1.0   # rad/s, in-place rotation
+    _TELE_WINDOW: float = 1.5   # sampling window for the telemetry liveness check
+
+    async def run(self, manager: "RemoteLabManager", client_id: str, args: dict):
+        logger = Logger.get()
+
+        all_names = [d.name for d in manager.get_devices()]
+        if not all_names:
+            await logger.log("PROC", "sync_test: no active devices — nothing to test")
+            return
+
+        # Acquire every device. Shared devices always succeed; an exclusive device
+        # held by another client is skipped (we test whatever we can reach).
+        acquired = []
+        for name in all_names:
+            if manager.acquire_device(name, client_id):
+                acquired.append(name)
+            else:
+                await logger.log("PROC", f"sync_test: skipping '{name}' (busy/owned)")
+        if not acquired:
+            await logger.log("PROC", "sync_test: no devices available right now")
+            return
+
+        try:
+            await logger.log("PROC", f"sync_test: running on {acquired}")
+
+            # 1. Beep — the whole group at once.
+            await manager.submit_command_wait(
+                client_id, acquired, "beep", self._PRIORITY,
+                {"duration": self._BEEP_S},
+            )
+
+            # 2. Spin LEFT in place.
+            await manager.submit_command_wait(
+                client_id, acquired, "move", self._PRIORITY,
+                {"speed_lin": 0.0, "speed_ang": self._SPIN_SPEED, "duration": self._SPIN_S},
+            )
+
+            # 3. Spin RIGHT in place.
+            await manager.submit_command_wait(
+                client_id, acquired, "move", self._PRIORITY,
+                {"speed_lin": 0.0, "speed_ang": -self._SPIN_SPEED, "duration": self._SPIN_S},
+            )
+
+            # 4. Telemetry liveness check.
+            alive, dead = await self._verify_telemetry(manager, acquired)
+            for name in alive:
+                await logger.log("PROC", f"sync_test: telemetry OK   '{name}'")
+            for name in dead:
+                await logger.log("PROC", f"sync_test: telemetry DEAD '{name}'")
+            if dead:
+                raise RuntimeError(f"No telemetry from: {dead}")
+
+            await logger.log("PROC", f"sync_test: PASSED for {acquired}")
+
+        finally:
+            for name in acquired:
+                manager.release_device(name, client_id)
+
+    async def _verify_telemetry(self, manager, names):
+        """Return (alive, dead): a device is alive if a fresh snapshot arrives within the window."""
+        def snapshot(name):
+            drv = manager.get_driver(name)
+            return drv.get_telemetry() if drv else None
+
+        first = {name: snapshot(name) for name in names}
+        await asyncio.sleep(self._TELE_WINDOW)
+
+        alive, dead = [], []
+        for name in names:
+            second = snapshot(name)
+            # A new snapshot OBJECT (driver replaces it per message) proves live flow.
+            if second is not None and first[name] is not second:
+                alive.append(name)
+            else:
+                dead.append(name)
+        return alive, dead
+
+
 class ProcedureManager:
     """
     Registry and executor for group procedures.
