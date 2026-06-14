@@ -5,6 +5,24 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Dict, Optional
 
 from Logger import Logger
 
+# Navigation deps are optional at import time: if numpy / the navigation package is
+# unavailable, only AllGoHome is disabled — the rest of the server still starts.
+try:
+    import numpy as np
+    from navigation import (
+        UKF,
+        WaypointController,
+        a_star,
+        world_to_cell,
+        build_localization_provider,
+        load_nav_config,
+    )
+    _NAV_AVAILABLE = True
+    _NAV_IMPORT_ERROR = ""
+except Exception as _e:  # pragma: no cover
+    _NAV_AVAILABLE = False
+    _NAV_IMPORT_ERROR = str(_e)
+
 if TYPE_CHECKING:
     from manager import RemoteLabManager
 
@@ -52,8 +70,9 @@ class StopAll(AbstractProcedure):
     currently running execute_command(). The driver is responsible for what
     happens next — Yarp13 publishes a zero Twist in its finally block.
 
-    # Maybe Step 3 - send STOP to every device, so we are not thinking about drivers and stuff?
-    #
+    Step 3 — cancel_all_procedures: any other running procedure (e.g. AllGoHome,
+    which drives robots via a direct velocity loop outside the scheduler) is
+    cancelled, so its teardown stops the robots. This procedure excludes itself.
 
     No device locks are acquired - this procedure is intentionally privileged.
     """
@@ -63,32 +82,168 @@ class StopAll(AbstractProcedure):
     async def run(self, manager: "RemoteLabManager", client_id: str, args: dict):
         manager.cancel_all_commands()
         manager.interrupt_all_devices()
+        manager.cancel_all_procedures(except_client=client_id)
 
 
 class AllGoHome(AbstractProcedure):
-    """Return all active robots to their home positions using camera + ArUco localization."""
+    """
+    Return all configured robots to their home cells.
+
+    Robots are driven home ONE AT A TIME (sequentially), not simultaneously: A*
+    plans against static obstacles only, so a moving robot must not become an
+    unmodelled (moving) obstacle for another. While one robot drives, the others
+    stand still, and their current cells are added to that robot's A* obstacle set,
+    so it routes around the parked ones too. Those cells are known exactly: a robot
+    that has not started yet sits at its start cell, one that finished sits at its
+    home cell.
+
+    Pipeline per robot:
+        localization (pose) -> UKF (state estimate) -> A* (path, avoiding static
+        obstacles + the other robots' current cells) -> waypoint controller ->
+        direct velocity stream to the robot.
+
+    Pose source is pluggable (see navigation.localization):
+      now — SimulatedLocalizationProvider (ground truth advanced from the
+        commanded velocities + Gaussian noise, exactly like the simulator camera);
+      later — ArucoLocalizationProvider (real ceiling cameras + ArUco). Switch by
+        setting "provider": "aruco" in nav_config.json. The navigation logic below
+        does NOT change — only the pose source.
+
+    Map, homes, markers and noise live in manager/nav_config.json (auto-created).
+
+    Control uses driver.set_velocity() (direct, low-latency). On cancel/E-stop the
+    finally block stops every robot and releases the locks; the driver deadman is
+    the final backstop.
+    """
 
     name = "all_go_home"
 
     async def run(self, manager: "RemoteLabManager", client_id: str, args: dict):
-        devices = [d.name for d in manager.get_devices()]
-        # TODO: read current robot poses from camera (ArUco marker detection)
-        # TODO: for each robot, compute a collision-free path to its home pose
-        # TODO: acquire devices, drive each robot along its path, release on exit
+        logger = Logger.get()
 
-        # UPD: kinda done - need to implement it here using real camera data
-        # (see github.com/nepike/allgohome)
-        #
-        #   for name in devices:
-        #       manager.acquire_device(name, client_id)
-        #   try:
-        #       await asyncio.gather(*[
-        #           _drive_to_home(manager, client_id, name, home_poses[name])
-        #           for name in devices
-        #       ])
-        #   finally:
-        #       for name in devices:
-        #           manager.release_device(name, client_id)
+        if not _NAV_AVAILABLE:
+            raise RuntimeError(f"navigation unavailable: {_NAV_IMPORT_ERROR}")
+
+        cfg = load_nav_config()
+        if cfg is None:
+            raise RuntimeError("nav_config.json is invalid — see server log")
+        if not cfg.robots:
+            await logger.log("PROC", "all_go_home: nav_config.json has no robots — configure homes")
+            return
+
+        loc = build_localization_provider(cfg)
+        await logger.log("PROC", f"all_go_home: localization = {loc.describe()}")
+
+        # Only active devices that are configured with a home cell.
+        names = [d.name for d in manager.get_devices() if d.name in cfg.robots]
+        if not names:
+            await logger.log("PROC", "all_go_home: no active devices listed in nav_config.json")
+            return
+
+        acquired = []
+        for name in names:
+            if manager.acquire_device(name, client_id):
+                acquired.append(name)
+                sc = cfg.robots[name].start  # (cell_x, cell_y, theta)
+                start_m = ((sc[0] + 0.5) * cfg.cell_size_m, (sc[1] + 0.5) * cfg.cell_size_m, sc[2])
+                loc.register(name, start_m)  # cells -> metres; seeds simulated truth (no-op for ArUco)
+            else:
+                await logger.log("PROC", f"all_go_home: skipping '{name}' (busy/owned)")
+        if not acquired:
+            await logger.log("PROC", "all_go_home: no devices available")
+            return
+
+        # Current cell of every robot, used as a dynamic obstacle set while another
+        # robot moves. Initially everyone is at its start cell.
+        positions = {
+            n: (int(cfg.robots[n].start[0]), int(cfg.robots[n].start[1])) for n in acquired
+        }
+
+        try:
+            await logger.log("PROC", f"all_go_home: navigating {acquired} (one at a time)")
+            home, failed = [], []
+            for name in acquired:
+                # All OTHER robots are stationary now -> treat their cells as obstacles.
+                others = {positions[o] for o in acquired if o != name}
+                ok = await self._drive_robot(manager, loc, cfg, name, others, logger)
+                (home if ok else failed).append(name)
+                # This robot is now parked at its home cell (an obstacle for the rest).
+                positions[name] = tuple(cfg.robots[name].home)
+            await logger.log("PROC", f"all_go_home: reached={home} failed={failed}")
+            if failed:
+                raise RuntimeError(f"Did not reach home: {failed}")
+        finally:
+            # Stop every robot and release, regardless of how we exit (success,
+            # failure, or cancellation via E-stop).
+            for name in acquired:
+                drv = manager.get_driver(name)
+                if drv is not None and hasattr(drv, "set_velocity"):
+                    try:
+                        drv.set_velocity(0.0, 0.0)
+                    except Exception:
+                        pass
+                manager.release_device(name, client_id)
+
+    async def _first_fix(self, loc, name, dt, tries=20):
+        """Wait for the first non-dropped localization measurement."""
+        for _ in range(tries):
+            pose = await loc.get_pose(name)
+            if pose is not None:
+                return pose
+            await asyncio.sleep(dt)
+        return None
+
+    async def _drive_robot(self, manager, loc, cfg, name, other_cells, logger):
+        """Drive one robot home, avoiding static obstacles + `other_cells` (the
+        current cells of the other, stationary robots). Returns (name, reached)."""
+        driver = manager.get_driver(name)
+        if driver is None or not hasattr(driver, "set_velocity"):
+            await logger.log("PROC", f"all_go_home: '{name}' has no velocity control — skipped")
+            return (name, False)
+
+        fix = await self._first_fix(loc, name, cfg.dt)
+        if fix is None:
+            await logger.log("PROC", f"all_go_home: '{name}' no localization fix")
+            return (name, False)
+
+        Q = np.diag(cfg.q_diag) ** 2
+        R = np.diag([cfg.r_pos, cfg.r_pos, cfg.r_theta]) ** 2
+        ukf = UKF(np.array(fix, dtype=float), np.eye(3) * 0.3, Q, R)
+
+        start_cell = world_to_cell(fix[0], fix[1], cfg)
+        home_cell = cfg.robots[name].home
+        # Static obstacles + the other robots' cells; never block our own start.
+        blocked = cfg.blocked | set(other_cells)
+        blocked.discard(start_cell)
+        path = a_star(start_cell, home_cell, blocked, cfg.grid_w, cfg.grid_h)
+        if not path:
+            await logger.log("PROC", f"all_go_home: '{name}' no path {start_cell} -> {home_cell}")
+            return (name, False)
+
+        ctrl = WaypointController(path, cfg)
+        max_steps = max(1, int(cfg.max_time_s / cfg.dt))
+
+        for _ in range(max_steps):
+            x, y, th = ukf.x
+            v, omega = ctrl.compute(x, y, th)
+
+            driver.set_velocity(v, omega)            # real command (direct velocity stream)
+            loc.apply_command(name, v, omega, cfg.dt)  # advance simulated truth (no-op for real ArUco)
+
+            meas = await loc.get_pose(name)          # noisy pose now / real camera later
+            ukf.predict((v, omega), cfg.dt)
+            ukf.update(meas)                         # update() ignores None (dropped frame)
+
+            if ctrl.reached(ukf.x[0], ukf.x[1]):
+                driver.set_velocity(0.0, 0.0)
+                await logger.log("PROC", f"all_go_home: '{name}' reached home")
+                return (name, True)
+
+            await asyncio.sleep(cfg.dt)
+
+        driver.set_velocity(0.0, 0.0)
+        await logger.log("PROC", f"all_go_home: '{name}' timed out before home")
+        return (name, False)
 
 
 class SyncTest(AbstractProcedure):
@@ -271,3 +426,15 @@ class ProcedureManager:
         for proc_id, owner in list(self._owners.items()):
             if owner == client_id:
                 self.cancel(proc_id)
+
+    def cancel_all(self, except_proc_client_id: Optional[str] = None) -> None:
+        """
+        Cancel every running procedure (used by the emergency stop_all).
+
+        `except_proc_client_id` is the proc-client-id of the caller so stop_all does
+        not cancel itself: a running procedure's proc-client-id is f"proc:{id[:8]}".
+        """
+        for proc_id, task in list(self._running.items()):
+            if except_proc_client_id is not None and f"proc:{proc_id[:8]}" == except_proc_client_id:
+                continue
+            task.cancel()

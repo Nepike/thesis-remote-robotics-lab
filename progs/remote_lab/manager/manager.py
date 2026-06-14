@@ -267,6 +267,15 @@ class RemoteLabManager:
         """Cancel a running procedure. No-op if already finished."""
         self._procedure_manager.cancel(procedure_id)
 
+    def cancel_all_procedures(self, except_client: Optional[str] = None):
+        """
+        Cancel every running procedure. Used by the emergency stop_all to halt
+        procedures that drive devices outside the scheduler (e.g. AllGoHome's
+        direct velocity loop). `except_client` is the caller's proc-client-id so
+        stop_all does not cancel itself.
+        """
+        self._procedure_manager.cancel_all(except_proc_client_id=except_client)
+
     @property
     def procedure_manager(self) -> ProcedureManager:
         """Expose ProcedureManager so ws_handler can wire its callbacks."""

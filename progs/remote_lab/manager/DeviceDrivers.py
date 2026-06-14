@@ -310,6 +310,7 @@ class Yarp13Driver(RosBasedDriver):
     _STREAM_HZ:   float = 10.0   # setpoint streaming rate, Hz
     _ONESHOT_S:   float = 0.3    # how long to stream a one-shot command (~3 frames)
     _STOP_TAIL_S: float = 0.6    # how long to keep streaming stop after motion ends
+    _DEADMAN_S:   float = 0.5    # set_velocity deadman: stop if no new setpoint within this
 
     # Each command targets one logical ACTUATOR CHANNEL. A command cancels the
     # running stop/off tail ONLY on its own channel, so independent actuators that
@@ -357,6 +358,48 @@ class Yarp13Driver(RosBasedDriver):
         self._tails[channel] = asyncio.create_task(
             self._stream(topic, msg_type, message, self._STOP_TAIL_S)
         )
+
+    def _topic(self, suffix: str) -> str:
+        ns = self._device.ros_namespace.strip("/")
+        return f"/{ns}/{suffix}"
+
+    def set_velocity(self, v: float, omega: float):
+        """
+        Publish ONE cmd_vel setpoint immediately, for closed-loop procedures that
+        run their own control loop (e.g. AllGoHome): the procedure calls this at a
+        fixed rate with fresh (v, omega).
+
+        Safety deadman: each call re-arms a background timer on the "drive" channel.
+        If new setpoints stop arriving (procedure crashes / is cancelled), the timer
+        fires after _DEADMAN_S and streams a stop — the robot never runs away.
+        Going through this method (not the scheduler) keeps the loop low-latency;
+        E-stop still works because stop_all cancels the owning procedure, whose
+        teardown stops the robot, and the deadman is the final backstop.
+        """
+        Twist = geometry_msgs.msg.Twist
+        topic = self._topic("cmd_vel")
+        twist = Twist()
+        twist.linear.x = float(v)
+        twist.angular.z = float(omega)
+        self._ros.publish(topic, Twist, twist)
+        self._arm_deadman("drive", topic, Twist, Twist(), self._DEADMAN_S)
+
+    def _arm_deadman(self, channel: str, topic: str, msg_type, stop_message, delay: float):
+        """
+        (Re)arm a deadman on `channel`: after `delay` with no refresh, stream the
+        stop value. Cancelled/replaced by the next set_velocity, so during active
+        control it never fires. Reuses the per-channel tail slot.
+        """
+        self._cancel_tail(channel)
+
+        async def _deadman():
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            await self._stream(topic, msg_type, stop_message, self._STOP_TAIL_S)
+
+        self._tails[channel] = asyncio.create_task(_deadman())
 
     async def setup_publishers(self):
         ns = self._device.ros_namespace.strip("/")
