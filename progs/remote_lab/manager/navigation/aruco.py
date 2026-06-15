@@ -232,6 +232,14 @@ class ArucoEngine:
         if not cap.isOpened():
             print(f"[aruco] cannot open camera source {cam.source!r}")
             return
+        # Low-latency capture: MJPG + a 1-frame buffer so read() returns the freshest
+        # frame (not a stale buffered one) — keeps the closed-loop control current and
+        # mitigates the VirtualBox V4L2 'select() timeout'.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         print(f"[aruco] camera {cam.source!r} opened")
         try:
             while not self._stop.is_set():

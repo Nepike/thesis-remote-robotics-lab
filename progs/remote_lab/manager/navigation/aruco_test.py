@@ -33,6 +33,7 @@ Flags:
 import argparse
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -73,27 +74,78 @@ def _camera_cfg(cfg, args):
     return cams[args.cam_index]
 
 
-def _open_capture(source):
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        sys.exit(f"Cannot open camera source {source!r}. Check the device index "
-                 f"(--camera 0/1/2 ...) and that the server is not already using it.")
-    # An opened-but-silent node (V4L2 'select() timeout') usually means the wrong
-    # /dev/videoN — many webcams expose several and only one streams. Fail fast with
-    # guidance instead of looping on empty reads forever.
-    for _ in range(3):
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            return cap
-    cap.release()
-    sys.exit(
-        f"Camera source {source!r} opened but returned NO frames (V4L2 select() timeout).\n"
-        f"  - This /dev/videoN is probably not the streaming node, or webcam passthrough is off.\n"
-        f"  - Find the streaming index:  python navigation/aruco_test.py --list-cameras\n"
-        f"  - Or override the config:    --camera 1   (then 2, 3 ...)\n"
-        f"  - System check:              v4l2-ctl --list-devices   (sudo apt install v4l-utils)\n"
-        f"  - VirtualBox: attach the cam via Devices > Webcams, or a USB filter + Extension Pack."
-    )
+class _FrameGrabber:
+    """
+    Background camera reader that always holds only the LATEST frame.
+
+    OpenCV's VideoCapture buffers frames internally. If the consumer (here the
+    matplotlib redraw, which costs 100+ ms) reads slower than the camera produces,
+    read() keeps returning ever-staler buffered frames and lag piles up to seconds.
+    This thread reads in a tight loop and keeps just the newest frame, so the GUI
+    always sees the present — lag drops to a single render period.
+
+    Also applies a low-latency capture setup (MJPG + 1-frame buffer, optional smaller
+    resolution) which additionally helps the VirtualBox V4L2 'select() timeout'.
+    """
+
+    def __init__(self, source, width=None, height=None):
+        self._cap = cv2.VideoCapture(source)
+        if not self._cap.isOpened():
+            sys.exit(f"Cannot open camera source {source!r}. Check the device index "
+                     f"(--camera 0/1/2 ...) and that the server is not already using it.")
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        try:
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        if width:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height:
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        # Fail fast on an opened-but-silent node (wrong /dev/videoN or passthrough off)
+        # instead of looping on empty reads forever.
+        frame = None
+        for _ in range(5):
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                break
+        if frame is None:
+            self._cap.release()
+            sys.exit(
+                f"Camera source {source!r} opened but returned NO frames (V4L2 select() timeout).\n"
+                f"  - This /dev/videoN is probably not the streaming node, or webcam passthrough is off.\n"
+                f"  - Find the streaming index:  python navigation/aruco_test.py --list-cameras\n"
+                f"  - Or override the config:    --camera 1   (then 2, 3 ...)\n"
+                f"  - Try a smaller frame:       --width 640 --height 480\n"
+                f"  - System check:              v4l2-ctl --list-devices   (sudo apt install v4l-utils)\n"
+                f"  - VirtualBox: attach the cam via Devices > Webcams, or a USB filter + Extension Pack."
+            )
+
+        self._frame = frame
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="aruco-test-grabber")
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                time.sleep(0.02)
+                continue
+            with self._lock:
+                self._frame = frame
+
+    def read(self):
+        """Return (True, latest_frame_copy). Always the freshest frame, never stale."""
+        with self._lock:
+            return True, self._frame.copy()
+
+    def release(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._cap.release()
 
 
 def _list_cameras(max_index=5):
@@ -142,7 +194,7 @@ def _classify(cfg, camcfg, marker_id, target_marker):
 def run_headless(cfg, args, robot, marker_id, yaw):
     camcfg = _camera_cfg(cfg, args)
     source = args.camera if args.camera is not None else camcfg.source
-    cap = _open_capture(source)
+    cap = _FrameGrabber(source, args.width, args.height)
     detect = _build_detector(cfg.aruco.dictionary)
     print(f"[test] tracking '{robot}' (marker {marker_id}); anchors needed: 4 of "
           f"{sorted(camcfg.anchors)}. Ctrl+C to stop.")
@@ -188,7 +240,7 @@ def run_visual(cfg, args, robot, marker_id, yaw):
 
     camcfg = _camera_cfg(cfg, args)
     source = args.camera if args.camera is not None else camcfg.source
-    cap = _open_capture(source)
+    cap = _FrameGrabber(source, args.width, args.height)
     detect = _build_detector(cfg.aruco.dictionary)
 
     xmax = cfg.grid_w * cfg.cell_size_m
@@ -273,6 +325,8 @@ def main():
     ap.add_argument("--robot", default=None, help="robot name to track")
     ap.add_argument("--camera", type=int, default=None, help="override capture device index")
     ap.add_argument("--cam-index", type=int, default=0, help="which aruco.cameras[] entry to use")
+    ap.add_argument("--width", type=int, default=None, help="capture width px (lower = less lag / fixes V4L2 timeout)")
+    ap.add_argument("--height", type=int, default=None, help="capture height px")
     ap.add_argument("--headless", action="store_true", help="console-only output (no GUI)")
     ap.add_argument("--list-cameras", action="store_true",
                     help="probe device indices 0..5 for a streaming camera and exit")
