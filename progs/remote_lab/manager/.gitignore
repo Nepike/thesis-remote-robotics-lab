@@ -6,7 +6,7 @@
 # Kept out of git so updating code never wipes registered users/devices.
 /devices.json
 /users.json
-/nav_config.json
+/navigation/nav_config.json
 /.idea/*
 /.venv/*
 /.virtualenv/*

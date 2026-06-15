@@ -2,9 +2,9 @@
 Configuration for the AllGoHome navigation: arena map, per-robot homes/markers,
 controller and filter parameters.
 
-Stored in manager/nav_config.json (gitignored — deployment-specific). If the file
-is missing it is created from a template using the default device names, so the
-procedure is runnable out of the box with the simulated pose provider.
+Stored in manager/navigation/nav_config.json (gitignored — deployment-specific). If
+the file is missing it is created from a template using the default device names, so
+the procedure is runnable out of the box with the simulated pose provider.
 
 Units: cells for the grid; metres and radians for the world; m/s and rad/s for
 speeds. One cell == cell_size_m metres.
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-_CONFIG_PATH = Path(__file__).parent.parent / "nav_config.json"  # manager/nav_config.json
+_CONFIG_PATH = Path(__file__).parent / "nav_config.json"  # manager/navigation/nav_config.json
 
 _TEMPLATE = {
     "_note": "AllGoHome map & params. Cells for the grid; m/s & rad/s for speeds. "

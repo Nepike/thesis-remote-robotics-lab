@@ -76,9 +76,51 @@ def _camera_cfg(cfg, args):
 def _open_capture(source):
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        sys.exit(f"Cannot open camera source {source!r}. Check the cable / device index "
-                 f"(try --camera 0, 1, 2 ...) and that the server is not already using it.")
-    return cap
+        sys.exit(f"Cannot open camera source {source!r}. Check the device index "
+                 f"(--camera 0/1/2 ...) and that the server is not already using it.")
+    # An opened-but-silent node (V4L2 'select() timeout') usually means the wrong
+    # /dev/videoN — many webcams expose several and only one streams. Fail fast with
+    # guidance instead of looping on empty reads forever.
+    for _ in range(3):
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return cap
+    cap.release()
+    sys.exit(
+        f"Camera source {source!r} opened but returned NO frames (V4L2 select() timeout).\n"
+        f"  - This /dev/videoN is probably not the streaming node, or webcam passthrough is off.\n"
+        f"  - Find the streaming index:  python navigation/aruco_test.py --list-cameras\n"
+        f"  - Or override the config:    --camera 1   (then 2, 3 ...)\n"
+        f"  - System check:              v4l2-ctl --list-devices   (sudo apt install v4l-utils)\n"
+        f"  - VirtualBox: attach the cam via Devices > Webcams, or a USB filter + Extension Pack."
+    )
+
+
+def _list_cameras(max_index=5):
+    """Probe /dev/video0..max_index and report which indices actually stream frames."""
+    print(f"Probing camera indices 0..{max_index} (a dead node can block ~10s)...")
+    found = []
+    for i in range(max_index + 1):
+        cap = cv2.VideoCapture(i)
+        if not cap.isOpened():
+            print(f"  index {i}: not opened")
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+            print(f"  index {i}: OK — streams {w}x{h}   <-- usable (set camera source to {i})")
+            found.append(i)
+        else:
+            print(f"  index {i}: opens but returns NO frames (not a capture node)")
+        cap.release()
+    if not found:
+        print("No streaming camera found. In VirtualBox check webcam passthrough "
+              "(Devices > Webcams) / USB filter + Extension Pack; on the host the cam "
+              "must be free (not used by another app).")
+    else:
+        print(f"Use one of: {found}. Put it in nav_config.json -> aruco.cameras[].source "
+              f"(or pass --camera <n>).")
 
 
 def _world_cell(x, y, cfg):
@@ -227,12 +269,18 @@ def run_visual(cfg, args, robot, marker_id, yaw):
 
 def main():
     ap = argparse.ArgumentParser(description="ArUco localization test for remote_lab")
-    ap.add_argument("--config", default=str(_MANAGER / "nav_config.json"))
+    ap.add_argument("--config", default=str(Path(__file__).resolve().parent / "nav_config.json"))
     ap.add_argument("--robot", default=None, help="robot name to track")
     ap.add_argument("--camera", type=int, default=None, help="override capture device index")
     ap.add_argument("--cam-index", type=int, default=0, help="which aruco.cameras[] entry to use")
     ap.add_argument("--headless", action="store_true", help="console-only output (no GUI)")
+    ap.add_argument("--list-cameras", action="store_true",
+                    help="probe device indices 0..5 for a streaming camera and exit")
     args = ap.parse_args()
+
+    if args.list_cameras:
+        _list_cameras()
+        return
 
     cfg = load_nav_config(Path(args.config))
     if cfg is None:
