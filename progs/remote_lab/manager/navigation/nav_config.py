@@ -18,16 +18,21 @@ from typing import Dict, List, Optional, Set, Tuple
 _CONFIG_PATH = Path(__file__).parent / "nav_config.json"  # manager/navigation/nav_config.json
 
 _TEMPLATE = {
-    "_note": "AllGoHome map & params. Cells for the grid; m/s & rad/s for speeds. "
-             "provider: 'simulated' (no camera) or 'aruco' (real cameras). "
-             "Pre-filled with the Test-1 example: 1 robot (marker 1), 4 anchors "
-             "(10-13), 3 obstacle cubes (20-22), 1 camera, arena 1.0x0.6 m. Adjust "
-             "the grid size and the MEASURED anchor metres to your arena, then set "
-             "provider='aruco' for a real run.",
+    "_note": "AllGoHome map & params. SINGLE source of truth = 'arena': set the field "
+             "width_m x height_m, the cell_size_m, and which ArUco id sits in each corner "
+             "(corner_markers: bl/br/tr/tl). The grid AND the anchor world coordinates "
+             "both derive from this — no separate grid/anchor tuning. Place 4 markers at "
+             "the field corners, measure the rectangle through their CENTRES (= width_m x "
+             "height_m), name the corners, done. m/s & rad/s for speeds. provider: "
+             "'simulated' (no camera) or 'aruco' (real cameras). Advanced / 2 cameras: "
+             "give explicit per-camera 'anchors' (id -> [x,y] m) to override the corners.",
     "provider": "simulated",
-    "cell_size_m": 0.1,
-    "grid_w": 10,
-    "grid_h": 6,
+    "arena": {
+        "width_m": 1.0,
+        "height_m": 0.6,
+        "cell_size_m": 0.1,
+        "corner_markers": {"bl": 10, "br": 11, "tr": 12, "tl": 13}
+    },
     "dt": 0.1,
     "max_linear_speed": 0.25,
     "max_angular_speed": 1.5,
@@ -45,28 +50,21 @@ _TEMPLATE = {
     },
     "obstacles": [],
     "aruco": {
-        "_note": "Real-camera pose source (provider='aruco'). Per camera, 'anchors' maps "
-                 "ArUco marker_id -> world (x, y) metres of that marker's CENTRE; >=4 "
-                 "anchors visible in a frame rebuild the homography that frame, so the "
-                 "camera may be moved freely as long as the anchors stay put and visible. "
-                 "Mount anchor markers at the SAME height as the robot markers to avoid "
-                 "parallax. 'obstacle_markers' lists ids treated as obstacles and mapped "
-                 "to grid cells live. Keep id ranges distinct: robots 1-9, anchors 10-19, "
-                 "obstacles 20-49.",
+        "_note": "Real-camera pose source (provider='aruco'). Anchors come from "
+                 "arena.corner_markers by default (their world metres derive from the "
+                 "arena size); >=4 visible in a frame rebuild the homography that frame, "
+                 "so the camera may be moved freely while the anchors stay put and "
+                 "visible. Mount anchor markers at the SAME height as the robot markers to "
+                 "avoid parallax. Override per camera with an explicit 'anchors' map "
+                 "(id -> [x, y] m), e.g. 2 cameras each seeing a different subset. "
+                 "'obstacle_markers' are mapped to grid cells live. Id ranges: robots 1-9, "
+                 "anchors 10-19, obstacles 20-49.",
         "dictionary": "DICT_5X5_50",
         "max_pose_age_s": 0.4,
         "obstacle_max_age_s": 3.0,
         "obstacle_markers": [20, 21, 22],
         "cameras": [
-            {
-                "source": 0,
-                "anchors": {
-                    "10": [0.05, 0.05],
-                    "11": [0.95, 0.05],
-                    "12": [0.95, 0.55],
-                    "13": [0.05, 0.55]
-                }
-            }
+            {"source": 0}
         ],
     },
     "robots": {
@@ -140,6 +138,21 @@ class NavConfig:
         return blocked
 
 
+_CORNERS = {"bl": (0.0, 0.0), "br": (1.0, 0.0), "tr": (1.0, 1.0), "tl": (0.0, 1.0)}
+
+
+def _corner_anchors(corner_markers: dict, width_m: float, height_m: float) -> Dict[int, Tuple[float, float]]:
+    """Expand corner_markers {'bl':10,...} -> {10:(0,0), 11:(W,0), 12:(W,H), 13:(0,H)}."""
+    out: Dict[int, Tuple[float, float]] = {}
+    for corner, mid in corner_markers.items():
+        key = str(corner).lower()
+        if key not in _CORNERS:
+            raise ValueError(f"corner '{corner}' must be one of bl/br/tr/tl")
+        ux, uy = _CORNERS[key]
+        out[int(mid)] = (ux * width_m, uy * height_m)
+    return out
+
+
 def _parse(raw: dict) -> NavConfig:
     noise = raw.get("noise", {})
     robots = {
@@ -151,25 +164,46 @@ def _parse(raw: dict) -> NavConfig:
         )
         for name, r in raw.get("robots", {}).items()
     }
+
+    # Single source of truth: 'arena' gives the field size; grid_w/grid_h and the
+    # corner-anchor world coordinates both derive from it. Legacy fallback: explicit
+    # top-level cell_size_m/grid_w/grid_h (+ explicit per-camera anchors).
+    arena = raw.get("arena")
+    if arena is not None:
+        cell = float(arena.get("cell_size_m", 0.1))
+        width_m = float(arena["width_m"])
+        height_m = float(arena["height_m"])
+        grid_w = max(1, int(round(width_m / cell)))
+        grid_h = max(1, int(round(height_m / cell)))
+        corner_markers = arena.get("corner_markers", {})
+    else:
+        cell = float(raw["cell_size_m"])
+        grid_w = int(raw["grid_w"])
+        grid_h = int(raw["grid_h"])
+        width_m, height_m = grid_w * cell, grid_h * cell
+        corner_markers = {}
+
+    def _camera(c: dict) -> CameraConfig:
+        explicit = c.get("anchors")
+        if explicit:                                  # advanced override (e.g. 2 cameras)
+            anchors = {int(k): tuple(v) for k, v in explicit.items()}
+        else:                                         # derive from arena corners
+            anchors = _corner_anchors(corner_markers, width_m, height_m)
+        return CameraConfig(source=c["source"], anchors=anchors)
+
     araw = raw.get("aruco", {})
     aruco = ArucoConfig(
         dictionary=araw.get("dictionary", "DICT_5X5_50"),
         max_pose_age_s=float(araw.get("max_pose_age_s", 0.4)),
         obstacle_max_age_s=float(araw.get("obstacle_max_age_s", 3.0)),
         obstacle_markers=[int(m) for m in araw.get("obstacle_markers", [])],
-        cameras=[
-            CameraConfig(
-                source=c["source"],
-                anchors={int(k): tuple(v) for k, v in c.get("anchors", {}).items()},
-            )
-            for c in araw.get("cameras", [])
-        ],
+        cameras=[_camera(c) for c in araw.get("cameras", [])],
     )
     return NavConfig(
         provider=raw.get("provider", "simulated"),
-        cell_size_m=float(raw["cell_size_m"]),
-        grid_w=int(raw["grid_w"]),
-        grid_h=int(raw["grid_h"]),
+        cell_size_m=cell,
+        grid_w=grid_w,
+        grid_h=grid_h,
         dt=float(raw["dt"]),
         max_linear_speed=float(raw["max_linear_speed"]),
         max_angular_speed=float(raw["max_angular_speed"]),
