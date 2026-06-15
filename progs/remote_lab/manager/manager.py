@@ -10,7 +10,7 @@ from DeviceDrivers import AbstractDriver, DriverFactory
 from DeviceSupervisor import DeviceSupervisor
 from HardwareInterfaces import RosInterface, SerialInterface
 from Logger import Logger
-from Procedures import AllGoHome, StopAll, SyncTest, ProcedureManager
+from Procedures import AllGoHome, StopAll, SyncTest, ProcedureManager, shutdown_navigation
 
 
 class RemoteLabManager:
@@ -118,6 +118,8 @@ class RemoteLabManager:
         await self._scheduler.shutdown()
         # Then tear down device processes
         await self._supervisor.shutdown()
+        # Release navigation resources (ArUco camera capture threads), if any
+        shutdown_navigation()
         # Finally release ROS resources
         self._ros.shutdown()
 

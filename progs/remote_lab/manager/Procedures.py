@@ -15,6 +15,7 @@ try:
         a_star,
         world_to_cell,
         build_localization_provider,
+        shutdown_localization,
         load_nav_config,
     )
     _NAV_AVAILABLE = True
@@ -22,6 +23,22 @@ try:
 except Exception as _e:  # pragma: no cover
     _NAV_AVAILABLE = False
     _NAV_IMPORT_ERROR = str(_e)
+
+
+def shutdown_navigation() -> None:
+    """
+    Release navigation resources (ArUco cameras) on server shutdown.
+
+    Safe to call unconditionally: a no-op when the navigation package failed to
+    import or when no ArUco provider was ever started. Called by
+    RemoteLabManager.shutdown().
+    """
+    if not _NAV_AVAILABLE:
+        return
+    try:
+        shutdown_localization()
+    except Exception:
+        pass
 
 if TYPE_CHECKING:
     from manager import RemoteLabManager
@@ -212,8 +229,11 @@ class AllGoHome(AbstractProcedure):
 
         start_cell = world_to_cell(fix[0], fix[1], cfg)
         home_cell = cfg.robots[name].home
-        # Static obstacles + the other robots' cells; never block our own start.
-        blocked = cfg.blocked | set(other_cells)
+        # Static obstacles + camera-detected obstacle cubes (snapshot now) + the other
+        # robots' cells; never block our own start. Dynamic obstacles are empty for the
+        # simulated provider.
+        dynamic = loc.get_dynamic_obstacles()
+        blocked = cfg.blocked | set(other_cells) | dynamic
         blocked.discard(start_cell)
         path = a_star(start_cell, home_cell, blocked, cfg.grid_w, cfg.grid_h)
         if not path:

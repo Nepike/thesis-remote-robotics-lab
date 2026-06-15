@@ -19,11 +19,15 @@ _CONFIG_PATH = Path(__file__).parent.parent / "nav_config.json"  # manager/nav_c
 
 _TEMPLATE = {
     "_note": "AllGoHome map & params. Cells for the grid; m/s & rad/s for speeds. "
-             "provider: 'simulated' (placeholder) or 'aruco' (real cameras).",
+             "provider: 'simulated' (no camera) or 'aruco' (real cameras). "
+             "Pre-filled with the Test-1 example: 1 robot (marker 1), 4 anchors "
+             "(10-13), 3 obstacle cubes (20-22), 1 camera, arena 1.0x0.6 m. Adjust "
+             "the grid size and the MEASURED anchor metres to your arena, then set "
+             "provider='aruco' for a real run.",
     "provider": "simulated",
-    "cell_size_m": 0.4,
-    "grid_w": 20,
-    "grid_h": 20,
+    "cell_size_m": 0.1,
+    "grid_w": 10,
+    "grid_h": 6,
     "dt": 0.1,
     "max_linear_speed": 0.25,
     "max_angular_speed": 1.5,
@@ -32,17 +36,41 @@ _TEMPLATE = {
     "angle_threshold": 0.25,
     "max_time_s": 120,
     "noise": {
-        "pos_std": 0.12,
-        "theta_std": 0.05,
+        "pos_std": 0.01,
+        "theta_std": 0.03,
         "drop_prob": 0.04,
-        "q_diag": [0.08, 0.08, 0.03],
-        "r_pos": 0.12,
-        "r_theta": 0.1,
+        "q_diag": [0.02, 0.02, 0.05],
+        "r_pos": 0.02,
+        "r_theta": 0.05,
     },
-    "obstacles": [[10, 5], [10, 6], [10, 7], [10, 8]],
+    "obstacles": [],
+    "aruco": {
+        "_note": "Real-camera pose source (provider='aruco'). Per camera, 'anchors' maps "
+                 "ArUco marker_id -> world (x, y) metres of that marker's CENTRE; >=4 "
+                 "anchors visible in a frame rebuild the homography that frame, so the "
+                 "camera may be moved freely as long as the anchors stay put and visible. "
+                 "Mount anchor markers at the SAME height as the robot markers to avoid "
+                 "parallax. 'obstacle_markers' lists ids treated as obstacles and mapped "
+                 "to grid cells live. Keep id ranges distinct: robots 1-9, anchors 10-19, "
+                 "obstacles 20-49.",
+        "dictionary": "DICT_5X5_50",
+        "max_pose_age_s": 0.4,
+        "obstacle_max_age_s": 3.0,
+        "obstacle_markers": [20, 21, 22],
+        "cameras": [
+            {
+                "source": 0,
+                "anchors": {
+                    "10": [0.05, 0.05],
+                    "11": [0.95, 0.05],
+                    "12": [0.95, 0.55],
+                    "13": [0.05, 0.55]
+                }
+            }
+        ],
+    },
     "robots": {
-        "Test-device-1": {"home": [1, 1], "start": [18, 18, 3.14], "marker_id": 1},
-        "Test-device-2": {"home": [18, 1], "start": [1, 18, 0.0], "marker_id": 2},
+        "Test-device-1": {"home": [1, 1], "start": [8, 4, 0.0], "marker_id": 1, "marker_yaw_offset": 0.0}
     },
 }
 
@@ -52,6 +80,22 @@ class RobotNav:
     home: Tuple[int, int]                 # target cell
     start: Tuple[float, float, float]     # start cell + heading (cx, cy, theta_rad); simulated provider only
     marker_id: Optional[int] = None       # ArUco marker id (real provider)
+    marker_yaw_offset: float = 0.0        # radians: marker mounting rotation vs robot forward (real provider)
+
+
+@dataclass
+class CameraConfig:
+    source: object                              # cv2.VideoCapture source: device index (int) or stream URL (str)
+    anchors: Dict[int, Tuple[float, float]]     # marker_id -> world (x, y) metres of the marker centre (homography)
+
+
+@dataclass
+class ArucoConfig:
+    dictionary: str = "DICT_5X5_50"
+    max_pose_age_s: float = 0.4               # a robot pose older than this -> get_pose() returns None
+    obstacle_max_age_s: float = 3.0           # a detected obstacle cube is remembered this long after last seen
+    obstacle_markers: List[int] = field(default_factory=list)   # ids treated as dynamic obstacles
+    cameras: List[CameraConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -77,6 +121,7 @@ class NavConfig:
     # map
     obstacles: List[Tuple[int, int]]
     robots: Dict[str, RobotNav]
+    aruco: ArucoConfig = field(default_factory=ArucoConfig)
     blocked: Set[Tuple[int, int]] = field(default_factory=set)
 
     def __post_init__(self):
@@ -102,9 +147,24 @@ def _parse(raw: dict) -> NavConfig:
             home=tuple(r["home"]),
             start=tuple(r.get("start", [0.0, 0.0, 0.0])),
             marker_id=r.get("marker_id"),
+            marker_yaw_offset=float(r.get("marker_yaw_offset", 0.0)),
         )
         for name, r in raw.get("robots", {}).items()
     }
+    araw = raw.get("aruco", {})
+    aruco = ArucoConfig(
+        dictionary=araw.get("dictionary", "DICT_5X5_50"),
+        max_pose_age_s=float(araw.get("max_pose_age_s", 0.4)),
+        obstacle_max_age_s=float(araw.get("obstacle_max_age_s", 3.0)),
+        obstacle_markers=[int(m) for m in araw.get("obstacle_markers", [])],
+        cameras=[
+            CameraConfig(
+                source=c["source"],
+                anchors={int(k): tuple(v) for k, v in c.get("anchors", {}).items()},
+            )
+            for c in araw.get("cameras", [])
+        ],
+    )
     return NavConfig(
         provider=raw.get("provider", "simulated"),
         cell_size_m=float(raw["cell_size_m"]),
@@ -125,6 +185,7 @@ def _parse(raw: dict) -> NavConfig:
         r_theta=float(noise.get("r_theta", 0.1)),
         obstacles=[tuple(o) for o in raw.get("obstacles", [])],
         robots=robots,
+        aruco=aruco,
     )
 
 

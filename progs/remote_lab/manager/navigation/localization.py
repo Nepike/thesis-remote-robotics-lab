@@ -12,16 +12,17 @@ simulator. This lets the whole procedure run and be validated end-to-end before 
 cameras exist.
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  TODO (когда установят камеры + ArUco): реализовать ArucoLocalizationProvider  ║
-║  и переключить provider в nav_config.json на "aruco". Логику навигации менять  ║
-║  НЕ нужно — только источник поз. См. класс ArucoLocalizationProvider ниже.     ║
+║  ArucoLocalizationProvider реализован (потолочные камеры + ArUco + гомография). ║
+║  Чтобы переключиться на реальные камеры: provider="aruco" в nav_config.json и   ║
+║  заполнить секцию "aruco" (камеры + точки калибровки). Логику навигации менять  ║
+║  НЕ нужно — меняется только источник поз. Захват — см. navigation/aruco.py.    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 import math
 import random
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 Pose = Tuple[float, float, float]  # (x, y, theta) in metres, radians
 
@@ -47,6 +48,15 @@ class LocalizationProvider(ABC):
         No-op for a real provider (the cameras observe actual motion). The simulated
         provider uses it to advance its internal ground truth.
         """
+
+    def get_dynamic_obstacles(self) -> Set[Tuple[int, int]]:
+        """
+        Grid cells currently occupied by camera-detected obstacles (ArUco cubes).
+
+        Merged with the static config obstacles by the procedure at planning time.
+        Empty for sources that cannot see obstacles (e.g. the simulated provider).
+        """
+        return set()
 
     def describe(self) -> str:
         return self.__class__.__name__
@@ -97,39 +107,101 @@ class SimulatedLocalizationProvider(LocalizationProvider):
 
 class ArucoLocalizationProvider(LocalizationProvider):
     """
-    Real pose source: two ceiling cameras + ArUco markers (НЕ РЕАЛИЗОВАНО).
+    Real pose source: ceiling camera(s) + ArUco markers, mapped to arena metres by
+    a per-camera homography (planar scene, no intrinsic calibration required).
 
-    TODO (завтра, после установки камер):
-      1. Открыть камеры (cv2.VideoCapture) по индексам/URL из cfg.
-      2. На каждый кадр: cv2.aruco.detectMarkers со словарём из cfg.
-      3. cv2.aruco.estimatePoseSingleMarkers (нужны cameraMatrix/distCoeffs из
-         калибровки) → поза маркера в системе камеры.
-      4. Перевести в МИРОВУЮ систему координат полигона (extrinsic-калибровка
-         камеры: положение/ориентация камеры над ареной), при двух камерах —
-         сшить/выбрать лучшую видимость.
-      5. Сопоставить marker_id → имя робота (cfg.robots[name].marker_id).
-      6. Кэшировать последнюю позу каждого робота; get_pose() возвращает её
-         (или None, если маркер сейчас не виден).
-    Метод apply_command остаётся no-op (истинное движение наблюдают камеры).
+    Construction starts a background capture/detection engine (one thread per
+    camera) that keeps a per-robot pose cache up to date; get_pose() just reads it.
+    The heavy lifting (OpenCV, threads, homography) lives in navigation/aruco.py,
+    imported lazily here so the simulated provider works without OpenCV installed.
+
+    Designed to be a long-lived singleton (see build_localization_provider): the
+    cameras open once and the engine runs for the whole server lifetime, regardless
+    of how many times AllGoHome is invoked. apply_command stays a no-op — the
+    cameras observe the robots' actual motion.
+
+    Configuration (nav_config.json):
+      - aruco.dictionary / aruco.max_pose_age_s / aruco.cameras[] (source + the
+        pixel<->metre calibration points);
+      - per robot: marker_id (which tag) and marker_yaw_offset (mounting rotation).
     """
 
     def __init__(self, cfg):
         self.cfg = cfg
-        # marker_id -> robot_name (готовая привязка для шага 5)
+        # marker_id -> robot_name, and robot_name -> mounting yaw offset (radians).
         self._marker_to_robot = {
             r.marker_id: name for name, r in cfg.robots.items() if r.marker_id is not None
         }
-        raise NotImplementedError(
-            "ArucoLocalizationProvider ещё не реализован. Установите камеры и "
-            "реализуйте захват/детекцию (см. TODO в классе), затем используйте его."
+        yaw_by_robot = {name: r.marker_yaw_offset for name, r in cfg.robots.items()}
+
+        try:
+            from .aruco import ArucoEngine  # lazy: OpenCV is only needed for the real provider
+        except ImportError as e:
+            raise RuntimeError(
+                "ArUco provider requires opencv-contrib-python (cv2.aruco): "
+                "pip install opencv-contrib-python"
+            ) from e
+
+        self._engine = ArucoEngine(cfg.aruco, self._marker_to_robot, yaw_by_robot)
+        self._engine.start()
+
+    async def get_pose(self, robot_name: str) -> Optional[Pose]:
+        # Reading the cache is non-blocking; the blocking camera I/O runs in the
+        # engine's own threads, so this never stalls the event loop.
+        return self._engine.get(robot_name)
+
+    def get_dynamic_obstacles(self) -> Set[Tuple[int, int]]:
+        """Map every freshly-seen obstacle cube to the grid cell it sits in."""
+        cell = self.cfg.cell_size_m
+        cells: Set[Tuple[int, int]] = set()
+        for x, y in self._engine.get_obstacle_points():
+            cx = min(max(int(x // cell), 0), self.cfg.grid_w - 1)
+            cy = min(max(int(y // cell), 0), self.cfg.grid_h - 1)
+            cells.add((cx, cy))
+        return cells
+
+    def close(self) -> None:
+        """Stop the capture threads and release the cameras (call on server shutdown)."""
+        self._engine.stop()
+
+    def describe(self) -> str:
+        return (
+            f"ArucoLocalizationProvider ({len(self.cfg.aruco.cameras)} camera(s), "
+            f"{self.cfg.aruco.dictionary})"
         )
 
-    async def get_pose(self, robot_name: str) -> Optional[Pose]:  # pragma: no cover
-        raise NotImplementedError
+
+# Long-lived singleton: the ArUco engine opens the cameras once and runs for the
+# whole server. build_localization_provider() is called on every AllGoHome run, so
+# it must return the SAME instance rather than re-opening the cameras each time.
+_aruco_singleton: Optional[ArucoLocalizationProvider] = None
 
 
 def build_localization_provider(cfg) -> LocalizationProvider:
-    """Factory: pick the provider by cfg.provider ('simulated' | 'aruco')."""
+    """
+    Factory: pick the provider by cfg.provider ('simulated' | 'aruco').
+
+    The simulated provider is stateful per run and created fresh each time. The
+    ArUco provider is a process-wide singleton (cameras stay open between runs);
+    camera/calibration changes in nav_config.json take effect on server restart.
+    """
     if cfg.provider == "aruco":
-        return ArucoLocalizationProvider(cfg)
+        global _aruco_singleton
+        if _aruco_singleton is None:
+            _aruco_singleton = ArucoLocalizationProvider(cfg)
+        return _aruco_singleton
     return SimulatedLocalizationProvider(cfg)
+
+
+def shutdown_localization() -> None:
+    """
+    Stop the ArUco singleton's capture threads and release its cameras.
+
+    Idempotent and safe to call when no ArUco provider was ever built. Intended to
+    be invoked from RemoteLabManager.shutdown() so USB cameras are released cleanly
+    on a normal server stop.
+    """
+    global _aruco_singleton
+    if _aruco_singleton is not None:
+        _aruco_singleton.close()
+        _aruco_singleton = None

@@ -15,8 +15,9 @@ from .localization import (
     SimulatedLocalizationProvider,
     ArucoLocalizationProvider,
     build_localization_provider,
+    shutdown_localization,
 )
-from .nav_config import NavConfig, RobotNav, load_nav_config
+from .nav_config import ArucoConfig, CameraConfig, NavConfig, RobotNav, load_nav_config
 
 __all__ = [
     "UKF",
@@ -28,7 +29,10 @@ __all__ = [
     "SimulatedLocalizationProvider",
     "ArucoLocalizationProvider",
     "build_localization_provider",
+    "shutdown_localization",
     "NavConfig",
     "RobotNav",
+    "ArucoConfig",
+    "CameraConfig",
     "load_nav_config",
 ]
