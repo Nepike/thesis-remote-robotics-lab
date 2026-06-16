@@ -229,10 +229,10 @@ class AllGoHome(AbstractProcedure):
 
         start_cell = world_to_cell(fix[0], fix[1], cfg)
         home_cell = cfg.robots[name].home
-        # Static obstacles + camera-detected obstacle cubes (snapshot now) + the other
-        # robots' cells; never block our own start. Dynamic obstacles are empty for the
-        # simulated provider.
-        dynamic = loc.get_dynamic_obstacles()
+        # Static obstacles + camera-detected obstacle cubes (snapshot now, inflated
+        # like the static ones for clearance) + the other robots' cells; never block
+        # our own start. Dynamic obstacles are empty for the simulated provider.
+        dynamic = cfg.inflate(loc.get_dynamic_obstacles())
         blocked = cfg.blocked | set(other_cells) | dynamic
         blocked.discard(start_cell)
         path = a_star(start_cell, home_cell, blocked, cfg.grid_w, cfg.grid_h)

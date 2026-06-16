@@ -7,6 +7,10 @@
 /devices.json
 /users.json
 /navigation/nav_config.json
+
+# Generated printable ArUco markers (make_markers.py)
+/navigation/markers/
+/markers/
 /.idea/*
 /.venv/*
 /.virtualenv/*

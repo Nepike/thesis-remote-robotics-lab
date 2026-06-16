@@ -7,7 +7,7 @@ cut outline and an id label under each one — so a whole batch prints on as few
 sheets as needed and is easy to cut out. Physical size is set in millimetres, so
 print at 100% / "actual size" and the markers come out exactly that big.
 
-Output (into --out, default ./markers):
+Output (into --out, default navigation/markers/ next to this script):
   - one PNG per A4 page (markers_page01.png, ...);
   - markers.pdf — a single print-ready A4 PDF with correct sizing (needs Pillow;
     skipped with a note if it is not installed).
@@ -128,7 +128,8 @@ def main():
     ap.add_argument("--label-mm", type=float, default=6.0, help="height of the id label strip, mm")
     ap.add_argument("--per-page", type=int, default=0, help="markers per page (0 = as many as fit)")
     ap.add_argument("--dpi", type=int, default=300, help="print resolution")
-    ap.add_argument("--out", default="markers", help="output directory")
+    ap.add_argument("--out", default=None,
+                    help="output directory (default: navigation/markers/ next to this script)")
     args = ap.parse_args()
 
     geo = _layout(args.dpi, args.marker_mm, args.border_mm, args.gap_mm, args.margin_mm, args.label_mm)
@@ -137,7 +138,9 @@ def main():
         print(f"[markers] only {geo['fit']} markers fit per A4 at {args.marker_mm} mm "
               f"({geo['cols']}x{geo['rows']}); using {geo['fit']} per page.")
 
-    out_dir = Path(args.out)
+    # Default next to this script (navigation/markers/) so the folder is created in
+    # the navigation package regardless of the current working directory.
+    out_dir = Path(args.out) if args.out else Path(__file__).resolve().parent / "markers"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pages = []

@@ -129,7 +129,8 @@ def _marker_pose(H: np.ndarray, corners: np.ndarray) -> Pose:
 class _Camera:
     """One physical camera: its capture source, its anchors, and its latest homography."""
 
-    def __init__(self, source, anchors: Dict[int, Tuple[float, float]], detect: Callable):
+    def __init__(self, index: int, source, anchors: Dict[int, Tuple[float, float]], detect: Callable):
+        self.index = index
         self.source = source
         self.anchors = dict(anchors)
         self._detect = detect
@@ -166,10 +167,10 @@ class ArucoEngine:
         self._obstacle_max_age = float(aruco_cfg.obstacle_max_age_s)
 
         detect = _build_detector(aruco_cfg.dictionary)
-        self._cameras = [_Camera(c.source, c.anchors, detect) for c in aruco_cfg.cameras]
+        self._cameras = [_Camera(i, c.source, c.anchors, detect) for i, c in enumerate(aruco_cfg.cameras)]
 
-        # robot_name -> (pose, timestamp, pixel_area)
-        self._cache: Dict[str, Tuple[Pose, float, float]] = {}
+        # robot_name -> (pose, timestamp, pixel_area, camera_index)
+        self._cache: Dict[str, Tuple[Pose, float, float, int]] = {}
         # obstacle marker_id -> (world (x, y), timestamp)
         self._obstacles: Dict[int, Tuple[Tuple[float, float], float]] = {}
         self._lock = threading.Lock()
@@ -201,7 +202,7 @@ class ArucoEngine:
             entry = self._cache.get(robot_name)
         if entry is None:
             return None
-        pose, ts, _area = entry
+        pose, ts, _area, _cam = entry
         if time.time() - ts > self._max_age:
             return None
         return pose
@@ -212,16 +213,18 @@ class ArucoEngine:
         with self._lock:
             return [xy for xy, ts in self._obstacles.values() if now - ts <= self._obstacle_max_age]
 
-    def _update(self, robot: str, pose: Pose, area: float, now: float) -> None:
+    def _update(self, robot: str, pose: Pose, area: float, now: float, cam_index: int) -> None:
         with self._lock:
             prev = self._cache.get(robot)
-            # Within the freshness window keep the larger-area (more head-on)
-            # detection; once the previous one is stale, any new detection replaces it.
+            # The SAME camera always refreshes (freshest pose wins). A DIFFERENT
+            # camera only preempts while the current entry is still fresh AND its
+            # view was more head-on (larger marker area) — so with two cameras the
+            # better view is preferred, without ever staling a single-camera feed.
             if prev is not None:
-                _p, p_ts, p_area = prev
-                if (now - p_ts) <= self._max_age and p_area > area:
+                _p, p_ts, p_area, p_cam = prev
+                if p_cam != cam_index and (now - p_ts) <= self._max_age and p_area > area:
                     return
-            self._cache[robot] = (pose, now, area)
+            self._cache[robot] = (pose, now, area, cam_index)
 
     def _update_obstacle(self, marker_id: int, xy: Tuple[float, float], now: float) -> None:
         with self._lock:
@@ -264,7 +267,7 @@ class ArucoEngine:
                     x, y, theta = _marker_pose(H, corners)
                     pose = (x, y, _normalize_angle(theta + self._yaw.get(robot, 0.0)))
                     area = float(cv2.contourArea(corners.astype(np.float32)))
-                    self._update(robot, pose, area, now)
+                    self._update(robot, pose, area, now, cam.index)
         finally:
             cap.release()
             print(f"[aruco] camera {cam.source!r} released")

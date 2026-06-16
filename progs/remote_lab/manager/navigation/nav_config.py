@@ -123,19 +123,23 @@ class NavConfig:
     blocked: Set[Tuple[int, int]] = field(default_factory=set)
 
     def __post_init__(self):
-        self.blocked = self._inflate(self.obstacles, self.grid_w, self.grid_h)
+        self.blocked = self.inflate(self.obstacles)
 
-    @staticmethod
-    def _inflate(obstacles, grid_w, grid_h) -> Set[Tuple[int, int]]:
-        """Obstacles plus a 1-cell inflation buffer (8-neighbourhood)."""
-        blocked: Set[Tuple[int, int]] = set()
-        for ox, oy in obstacles:
+    def inflate(self, cells) -> Set[Tuple[int, int]]:
+        """
+        Expand each cell by a 1-cell buffer (8-neighbourhood), clamped to the grid.
+
+        Used for the static config obstacles (here) and for the live camera-detected
+        obstacle cubes (in the procedure), so both get the same clearance.
+        """
+        out: Set[Tuple[int, int]] = set()
+        for ox, oy in cells:
             for dx in (-1, 0, 1):
                 for dy in (-1, 0, 1):
                     x, y = ox + dx, oy + dy
-                    if 0 <= x < grid_w and 0 <= y < grid_h:
-                        blocked.add((x, y))
-        return blocked
+                    if 0 <= x < self.grid_w and 0 <= y < self.grid_h:
+                        out.add((x, y))
+        return out
 
 
 _CORNERS = {"bl": (0.0, 0.0), "br": (1.0, 0.0), "tr": (1.0, 1.0), "tl": (0.0, 1.0)}
