@@ -42,6 +42,26 @@ def _normalize_angle(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
+def _detector_params(aruco):
+    """
+    Detector tuning that raises the detection rate for tilted / unevenly lit / smaller
+    markers — e.g. a second camera mounted at a shallow angle — and refines corner
+    accuracy (steadier pose). Works on both the >=4.7 and <=4.6 cv2.aruco APIs.
+    """
+    params = aruco.DetectorParameters() if hasattr(aruco, "ArucoDetector") else aruco.DetectorParameters_create()
+    # Sub-pixel corner refinement: sharper corners -> less pose jitter, esp. at angles.
+    if hasattr(aruco, "CORNER_REFINE_SUBPIX"):
+        params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    # Wider adaptive-threshold sweep copes with glare / uneven lighting across a tilted view.
+    params.adaptiveThreshWinSizeMin = 3
+    params.adaptiveThreshWinSizeMax = 35
+    params.adaptiveThreshWinSizeStep = 4
+    # Accept smaller / farther / foreshortened quads (a marker seen edge-on looks small).
+    params.minMarkerPerimeterRate = 0.02
+    params.polygonalApproxAccuracyRate = 0.05
+    return params
+
+
 def _build_detector(dict_name: str) -> Callable:
     """
     Return a detect(gray) -> (corners, ids, rejected) callable for the named
@@ -58,13 +78,12 @@ def _build_detector(dict_name: str) -> Callable:
     else:                                              # very old API
         dictionary = aruco.Dictionary_get(dict_id)
 
+    params = _detector_params(aruco)
     if hasattr(aruco, "ArucoDetector"):               # OpenCV >= 4.7
-        params = aruco.DetectorParameters()
         detector = aruco.ArucoDetector(dictionary, params)
         return lambda gray: detector.detectMarkers(gray)
 
-    params = aruco.DetectorParameters_create()        # OpenCV <= 4.6
-    return lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params)
+    return lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params)   # OpenCV <= 4.6
 
 
 def _detect_markers(detect: Callable, frame) -> Dict[int, np.ndarray]:
@@ -164,8 +183,13 @@ class ArucoEngine:
         self._obstacle_max_age = float(aruco_cfg.obstacle_max_age_s)
         self._anchors = dict(aruco_cfg.anchors)
 
-        detect = _build_detector(aruco_cfg.dictionary)
-        self._cameras = [_Camera(i, c.source, self._anchors, detect) for i, c in enumerate(aruco_cfg.cameras)]
+        # One detector PER camera: cv2.aruco.ArucoDetector is NOT thread-safe and each
+        # camera runs in its own thread — a single shared detector corrupts detection on
+        # the other camera(s) and throws. A per-camera detector keeps them independent.
+        self._cameras = [
+            _Camera(i, c.source, self._anchors, _build_detector(aruco_cfg.dictionary))
+            for i, c in enumerate(aruco_cfg.cameras)
+        ]
         # Per-camera measurement-noise covariance R (metres / radians), the fusion weight.
         self._cam_R = [np.diag([c.r_pos, c.r_pos, c.r_theta]) ** 2 for c in aruco_cfg.cameras]
 

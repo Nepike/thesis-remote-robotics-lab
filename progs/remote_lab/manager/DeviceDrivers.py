@@ -495,6 +495,18 @@ class Yarp13Driver(RosBasedDriver):
 
         elif command.name in ("dctl", "pidctl"):
             # Direct PWM or PID wheel speed.  arg: w_l, w_r in [-255, +255], optional duration.
+            #
+            # With `duration`: drive that long, then a background stop tail halts the robot
+            # (timed move). WITHOUT `duration`: HOLD — set the wheel speed and do NOT stop;
+            # the caller keeps it alive (streams the setpoint) and stops it explicitly
+            # (e.g. dctl w_l=w_r=0 with a duration). Used by the joystick teleop so
+            # consecutive setpoints don't fight a stop tail.
+            #
+            # TODO: подумать про безопасность HOLD. Сейчас единственный backstop, когда
+            # клиент перестал слать но остался на связи (или умер), — прошивочный watchdog
+            # (Wait_cmd_time ~2 c, к тому же под тумблером SW_CONNECT). Прежде чем полагаться
+            # на HOLD в проде: укоротить Wait_cmd_time / развязать от тумблера, и/или слать
+            # стоп на дисконнект клиента со стороны сервера.
             yy = Cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("w_l", 0.0)), float(a.get("w_r", 0.0))]
@@ -504,7 +516,8 @@ class Yarp13Driver(RosBasedDriver):
             try:
                 await self._stream(yy_cmd, Cmd, yy, float(a.get("duration", 0.0)))
             finally:
-                self._start_tail(channel, yy_cmd, Cmd, stop)
+                if float(a.get("duration", 0.0)):   # HOLD (no duration) -> no auto-stop
+                    self._start_tail(channel, yy_cmd, Cmd, stop)
 
         elif command.name == "beep":
             # Stream beep_on for `duration`, then stream beep_off as the tail.

@@ -3,25 +3,28 @@ controller.py — управление роботом лаборатории с 
 
 Подключи джойстик/геймпад к компу, запусти скрипт — двигаешь левым стиком, робот
 едет в ту же сторону; держишь кнопку — робот пищит. Команды уходят на сервер
-обычными средствами клиентской библиотеки (submit/interrupt), ничего серверного
-трогать не нужно.
+обычными средствами клиентской библиотеки (submit/interrupt).
 
     pip install pygame
     python client/controller.py
 
-Как это работает (чтобы не копить очередь команд и не «терять» робота):
-  Драйв: при изменении стика (с зоной нечувствительности) или раз в KEEPALIVE с
-    шлём interrupt() + move(speed_lin, speed_ang, duration=HOLD). interrupt снимает
-    текущий поток скорости и сразу запускает новый — низкая задержка, очередь не
-    растёт. duration работает как «deadman»: если скрипт упадёт, робот сам встанет.
-  Beep: по фронту кнопки — beep_on при нажатии, beep_off при отпускании (реле
-    «липкое», тон держится между move-командами; короткая пауза драйва на фронте —
-    норма, т.к. устройство выполняет команды по одной).
-  Центр стика → один stop, дальше команды не шлём (нет лишнего трафика).
+Как это работает (плавно, без рывков):
+  Драйв: левый стик -> ШИМ левого/правого колеса (микс вперёд/поворот). Шлём команду
+    `dctl` БЕЗ duration — это HOLD-режим: драйвер задаёт скорость и НЕ ставит стоп-хвост,
+    робот держит её до следующей команды. Поэтому соседние сетпоинты не дерутся со
+    стопами -> плавно. Шлём только при изменении стика + раз в KEEPALIVE (keepalive
+    «кормит» прошивочный watchdog, чтобы ровный ход не сбрасывался).
+  Стоп: при отпускании/центре/кнопке стоп шлём `dctl 0 0` С duration — это
+    стримит ноль + стоп-хвост, т.е. надёжная остановка поверх теряющего линка.
+  Beep: по фронтам кнопки (отдельный канал, на драйв не влияет).
 
-Подбор индексов осей/кнопок под твой геймпад: запусти с PROBE = True (внизу) — скрипт
-выведет живые значения осей и кнопок, не отправляя команд. Найди нужные и впиши в
-AXIS_FWD / AXIS_TURN / BEEP_BUTTON / STOP_BUTTON.
+⚠️ Безопасность HOLD: пока клиент шлёт keepalive — робот едет; перестал (упал/завис/
+  разрыв) — его должен остановить watchdog ПРОШИВКИ по таймауту команды
+  (Wait_cmd_time, сейчас ~2 c и под тумблером SW_CONNECT — см. TODO в DeviceDrivers).
+  Убедись, что SW_CONNECT включён; в идеале укороти Wait_cmd_time и снизь KEEPALIVE.
+
+Подбор индексов осей/кнопок под твой геймпад: PROBE = True (внизу) — печатает живые
+оси/кнопки без отправки команд. Найди нужные и впиши в AXIS_* / *_BUTTON.
 """
 
 import asyncio
@@ -46,22 +49,22 @@ PASSWORD   = "1234"
 DEVICE     = None          # имя устройства; None -> первое активное
 
 # Раскладка геймпада (если не подходит — включи PROBE и посмотри индексы)
-AXIS_FWD    = 1            # левый стик: вперёд/назад
+AXIS_FWD    = 1           # левый стик: вперёд/назад
 AXIS_TURN   = 0           # левый стик: влево/вправо
 INVERT_FWD  = True        # у большинства геймпадов «вверх» = отрицательное значение
-INVERT_TURN = True        # «влево» = отрицательное -> хотим это в +угловую (CCW)
+INVERT_TURN = True        # «влево» = отрицательное -> хотим поворот влево (CCW)
 BEEP_BUTTON = 0           # кнопка «пищать» (Xbox A)
-STOP_BUTTON = 1           # кнопка аварийной остановки (Xbox B)
+STOP_BUTTON = 1           # кнопка остановки (Xbox B)
 
-# Динамика и темп
-MAX_LIN   = 0.5           # м/с при полном отклонении стика
-MAX_ANG   = 1.5           # рад/с при полном отклонении
-DEADZONE  = 0.12          # зона нечувствительности стика (0..1)
-LOOP_HZ   = 20            # частота опроса геймпада
-KEEPALIVE = 0.3           # как часто обновлять удерживаемую ненулевую команду, с
-HOLD      = 0.5           # длительность move (deadman); > KEEPALIVE, чтобы без разрывов
-DEADBAND  = 0.04          # мин. относительное изменение (lin/ang), чтобы переслать
-MIN_SEND_DT = 0.08        # не чаще этого слать команды, с
+# Драйв
+DRIVE_CMD    = "dctl"     # "dctl" = сырой ШИМ (ПИД off), "pidctl" = замкнутая скорость колёс
+MAX_PWM      = 200        # ШИМ при полном отклонении стика (|.| <= 255)
+DEADZONE     = 0.12       # зона нечувствительности стика (0..1)
+LOOP_HZ      = 20         # частота опроса геймпада, Гц
+KEEPALIVE    = 0.5        # как часто обновлять удерживаемую скорость (кормить watchdog), с
+                          #   ВАЖНО: < Wait_cmd_time прошивки, иначе ровный ход будет сбрасываться
+PWM_DEADBAND = 6          # мин. изменение ШИМ, чтобы переслать
+STOP_DUR     = 0.3        # длительность стрима стопа при отпускании (надёжная остановка), с
 
 PROBE = False             # True -> только печатать оси/кнопки, команды не слать
 
@@ -102,13 +105,6 @@ class Gamepad:
             return False
         return bool(self.js.get_button(i))
 
-    def pressed_edge(self, i: int) -> bool:
-        """True ровно в тот опрос, когда кнопку нажали (фронт нажатия)."""
-        now = self.button(i)
-        was = self._prev_buttons.get(i, False)
-        self._prev_buttons[i] = now
-        return now and not was
-
     def edge(self, i: int):
         """Вернуть 'down'/'up'/None — фронт нажатия/отпускания кнопки."""
         now = self.button(i)
@@ -124,11 +120,14 @@ class Gamepad:
         pygame.quit()
 
 
-def _axes_to_cmd(pad: Gamepad):
-    """Левый стик -> (speed_lin м/с, speed_ang рад/с)."""
+def _axes_to_pwm(pad: Gamepad):
+    """Левый стик -> (w_l, w_r) ШИМ колёс в [-MAX_PWM, +MAX_PWM] (дифф-привод)."""
     fwd = pad.axis(AXIS_FWD) * (-1 if INVERT_FWD else 1)
     turn = pad.axis(AXIS_TURN) * (-1 if INVERT_TURN else 1)
-    return fwd * MAX_LIN, turn * MAX_ANG
+    left = fwd - turn          # +turn -> правое колесо быстрее -> поворот влево (CCW)
+    right = fwd + turn
+    m = max(1.0, abs(left), abs(right))   # нормируем, чтобы не вылезти за MAX_PWM
+    return (left / m) * MAX_PWM, (right / m) * MAX_PWM
 
 
 async def _probe(pad: Gamepad):
@@ -145,53 +144,54 @@ async def _probe(pad: Gamepad):
         print()
 
 
+async def _drive_hold(robot, w_l: float, w_r: float):
+    """HOLD-сетпоинт: задать ШИМ колёс без стоп-хвоста (держится до следующей команды)."""
+    await robot.interrupt()   # снять предыдущий сетпоинт/стрим; у HOLD нет хвоста -> без блипа
+    await robot.submit(DRIVE_CMD, priority=5, w_l=round(w_l), w_r=round(w_r))
+
+
+async def _drive_stop(robot):
+    """Надёжная остановка: стрим нуля + стоп-хвост (переживает потерю кадров)."""
+    await robot.interrupt()
+    await robot.submit(DRIVE_CMD, priority=8, w_l=0, w_r=0, duration=STOP_DUR)
+
+
 async def _teleop(robot, pad: Gamepad):
-    """Главный цикл: стик -> move, кнопка -> beep, центр -> stop."""
-    last_lin = last_ang = 0.0
+    """Главный цикл: стик -> HOLD-сетпоинт, центр/стоп -> остановка, кнопка -> beep."""
+    last_l = last_r = 0.0
     last_send = 0.0
     moving = False
-    print("\nЕзжай! Левый стик — движение, кнопка A — beep, B — аварийный стоп, Ctrl+C — выход.\n")
+    print("\nЕзжай! Левый стик — движение, кнопка A — beep, B — стоп, Ctrl+C — выход.\n")
 
     while True:
         pad.poll()
         now = time.monotonic()
 
-        # Аварийный стоп — наивысший приоритет
-        if pad.pressed_edge(STOP_BUTTON):
-            await robot.interrupt()
-            await robot.submit("stop", priority=999)
-            moving = False
-            last_lin = last_ang = 0.0
-            last_send = now
-            print("  [STOP]")
-
-        # Beep — по фронтам кнопки (липкое реле держит тон между move-командами)
+        # Beep — по фронтам кнопки
         be = pad.edge(BEEP_BUTTON)
         if be == "down":
             await robot.submit("beep_on", priority=9)
         elif be == "up":
             await robot.submit("beep_off", priority=9)
 
-        # Драйв
-        lin, ang = _axes_to_cmd(pad)
-        nonzero = (lin != 0.0 or ang != 0.0)
-        changed = (abs(lin - last_lin) > DEADBAND * MAX_LIN or
-                   abs(ang - last_ang) > DEADBAND * MAX_ANG)
-        due = (now - last_send) > KEEPALIVE
+        # Стик -> ШИМ (или ноль по кнопке стоп)
+        if pad.button(STOP_BUTTON):
+            w_l, w_r = 0.0, 0.0
+        else:
+            w_l, w_r = _axes_to_pwm(pad)
 
-        if (now - last_send) >= MIN_SEND_DT and (changed or (nonzero and due) or (not nonzero and moving)):
-            if nonzero:
-                # interrupt снимает текущий поток скорости, новый move стартует сразу
-                await robot.interrupt()
-                await robot.submit("move", priority=5,
-                                   speed_lin=round(lin, 3), speed_ang=round(ang, 3), duration=HOLD)
-                moving = True
-            else:
-                # стик в центре -> один стоп, дальше молчим
-                await robot.interrupt()
-                await robot.submit("stop", priority=8)
-                moving = False
-            last_lin, last_ang, last_send = lin, ang, now
+        nonzero = (round(w_l) != 0 or round(w_r) != 0)
+        changed = (abs(w_l - last_l) > PWM_DEADBAND or abs(w_r - last_r) > PWM_DEADBAND)
+        due = (now - last_send) > KEEPALIVE     # keepalive держит watchdog робота сытым
+
+        if nonzero and (changed or due):
+            await _drive_hold(robot, w_l, w_r)
+            last_l, last_r, last_send, moving = w_l, w_r, now, True
+        elif not nonzero and moving:
+            # отпустили / центр / кнопка стоп -> надёжно гасим один раз
+            await _drive_stop(robot)
+            last_l = last_r = 0.0
+            last_send, moving = now, False
 
         await asyncio.sleep(1.0 / LOOP_HZ)
 
@@ -221,8 +221,7 @@ async def main():
                 finally:
                     # Гарантированно гасим движение и пищалку при выходе
                     try:
-                        await robot.interrupt()
-                        await robot.submit("stop", priority=999)
+                        await _drive_stop(robot)
                         await robot.submit("beep_off", priority=999)
                     except Exception:
                         pass

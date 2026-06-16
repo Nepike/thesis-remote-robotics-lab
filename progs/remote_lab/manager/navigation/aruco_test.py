@@ -363,7 +363,10 @@ def run_visual(cfg, args, robot, marker_id, yaw):
                              f"cell={_world_cell(fx, fy, cfg)}  [{len(per_cam)} cam]")
         else:
             ax_map.set_title("robot not localized")
-        ax_map.legend(loc="upper right", fontsize=8)
+        # Only draw a legend when something labelled is on the axes, otherwise
+        # matplotlib spams "No artists with labels found" every frame.
+        if ax_map.get_legend_handles_labels()[1]:
+            ax_map.legend(loc="upper right", fontsize=8)
 
     print("[test] close the window to quit.")
     while plt.fignum_exists(fig.number):
