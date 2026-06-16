@@ -151,15 +151,24 @@ class UKF:
         self.x = x_pred
         self.P = P_pred
 
-    def update(self, z):
+    def update(self, z, R=None):
+        """
+        Correct the state with a measurement z = (x, y, theta).
+
+        `R` overrides the default measurement-noise covariance for this update — used
+        for fusion: call update once per camera measurement, each with that camera's
+        R. Consecutive updates with no predict between them combine optimally (this
+        is equivalent to a single stacked measurement for independent noise).
+        """
         if z is None:
             return
         z = np.array(z, dtype=float)
+        R = self.R if R is None else np.asarray(R, dtype=float)
         pts, Wm, Wc = self._sigma_points(self.x, self.P)
         Z = pts.copy()  # identity measurement model
         z_mean = self._mean_state(Z, Wm)
 
-        Pzz = self.R.copy()
+        Pzz = R.copy()
         Pxz = np.zeros((3, 3), dtype=float)
         for i in range(Z.shape[0]):
             dz = Z[i] - z_mean

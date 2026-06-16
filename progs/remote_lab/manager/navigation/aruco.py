@@ -1,31 +1,30 @@
 """
-ArUco capture + homography engine behind ArucoLocalizationProvider.
+ArUco capture + homography engine behind ArucoLocalizationProvider (FUSION model).
 
 Kept separate from localization.py so that importing the navigation package (and
 running the simulated provider) never pulls in OpenCV: cv2 is imported only here,
 and this module is only imported when the real ArUco provider is constructed.
 
-Coordinate calibration is fiducial-based and self-correcting: a set of ANCHOR
-markers sit at known world (x, y) positions (nav_config.json -> aruco.cameras[].
-anchors). Every frame, if >=4 anchors are visible, their detected pixel centres +
-known metres rebuild the camera homography (pixels -> arena metres) for that frame
-— so the camera can be bumped/moved without re-calibration, as long as the anchors
-stay put and visible. If fewer than 4 are visible, the last good homography is
-reused. Mount anchor markers at the SAME height as the robot markers so the planar
-homography has no parallax error.
+Fusion setup: EVERY camera sees the whole arena, so all cameras share the SAME 4
+corner anchors (nav_config.json -> arena.corner_markers, expanded to world metres).
+Every frame, each camera rebuilds its own pixels->arena homography from the visible
+anchors (>=4) — so a camera may be bumped/moved without re-calibration, as long as
+the anchors stay put and visible. Mount anchor markers at the SAME height as the
+robot markers so the planar homography has no parallax error.
+
+Each camera independently produces one pose per visible robot. The engine does NOT
+merge them into a single "best" pose — it keeps ALL fresh per-camera measurements,
+and get_measurements() returns them so the consumer's Kalman filter can fuse them
+(weighted by each camera's R). This is the key difference from a tiling/selection
+setup: nothing is thrown away; more views -> better estimate.
 
 Pipeline (per camera, in its own background thread because VideoCapture.read() is
 blocking):
     grab frame -> detectMarkers -> rebuild homography from visible anchors
     -> for every non-anchor marker: map its corners through H to arena metres
        (centre = mean of corners, heading = atan2 of the marker's +x edge in world)
-    -> robot markers update the pose cache; obstacle markers update the obstacle cache.
-
-get() returns a robot pose only if fresher than max_pose_age_s (else None, matching
-the LocalizationProvider contract). With two cameras the larger-area (more head-on)
-detection wins while fresh. get_obstacle_points() returns the world positions of
-obstacle cubes seen within obstacle_max_age_s (static cubes are remembered a few
-seconds so a momentary occlusion does not drop them).
+    -> robot markers update that camera's per-robot measurement; obstacle markers
+       update the shared obstacle cache.
 """
 
 import math
@@ -127,12 +126,12 @@ def _marker_pose(H: np.ndarray, corners: np.ndarray) -> Pose:
 
 
 class _Camera:
-    """One physical camera: its capture source, its anchors, and its latest homography."""
+    """One physical camera: its capture source, the shared anchors, and its latest homography."""
 
     def __init__(self, index: int, source, anchors: Dict[int, Tuple[float, float]], detect: Callable):
         self.index = index
         self.source = source
-        self.anchors = dict(anchors)
+        self.anchors = dict(anchors)                 # shared global corner anchors
         self._detect = detect
         self.H: Optional[np.ndarray] = None          # last good homography (None until 4 anchors seen)
 
@@ -147,16 +146,14 @@ class _Camera:
 
 class ArucoEngine:
     """
-    Background ArUco localization: one thread per camera feeding shared caches.
+    Background multi-camera ArUco localization for FUSION: one thread per camera
+    feeding shared caches. Constructed once and kept alive for the whole server
+    (the provider is a singleton), so cameras open exactly once.
 
-    Constructed once and kept alive for the whole server (the provider is a
-    singleton), so cameras open exactly once. Call start() after construction and
-    stop() on shutdown.
-
-    Two caches are maintained:
-      - robot poses (marker_id -> robot), read by get();
-      - obstacle cube positions (ids in obstacle_markers), read by
-        get_obstacle_points() and turned into grid cells by the provider.
+    Robot measurements are stored per (robot, camera): get_measurements(robot)
+    returns every camera's fresh pose for that robot, each with that camera's R, so
+    the consumer fuses them in its filter. Obstacle cubes are stored per marker id
+    (any camera refreshes them; positions are coarse and only mapped to cells).
     """
 
     def __init__(self, aruco_cfg, marker_to_robot: Dict[int, str], yaw_by_robot: Dict[str, float]):
@@ -165,12 +162,15 @@ class ArucoEngine:
         self._obstacle_markers = set(aruco_cfg.obstacle_markers)
         self._max_age = float(aruco_cfg.max_pose_age_s)
         self._obstacle_max_age = float(aruco_cfg.obstacle_max_age_s)
+        self._anchors = dict(aruco_cfg.anchors)
 
         detect = _build_detector(aruco_cfg.dictionary)
-        self._cameras = [_Camera(i, c.source, c.anchors, detect) for i, c in enumerate(aruco_cfg.cameras)]
+        self._cameras = [_Camera(i, c.source, self._anchors, detect) for i, c in enumerate(aruco_cfg.cameras)]
+        # Per-camera measurement-noise covariance R (metres / radians), the fusion weight.
+        self._cam_R = [np.diag([c.r_pos, c.r_pos, c.r_theta]) ** 2 for c in aruco_cfg.cameras]
 
-        # robot_name -> (pose, timestamp, pixel_area, camera_index)
-        self._cache: Dict[str, Tuple[Pose, float, float, int]] = {}
+        # robot_name -> {camera_index: (pose, timestamp)}  — ALL cameras kept (no selection)
+        self._meas: Dict[str, Dict[int, Tuple[Pose, float]]] = {}
         # obstacle marker_id -> (world (x, y), timestamp)
         self._obstacles: Dict[int, Tuple[Tuple[float, float], float]] = {}
         self._lock = threading.Lock()
@@ -181,11 +181,11 @@ class ArucoEngine:
         if self._threads:
             return
         if not self._cameras:
-            print("[aruco] no cameras configured in nav_config.json — get_pose() will always return None")
+            print("[aruco] no cameras configured in nav_config.json — get_measurements() is always empty")
+        if len(self._anchors) < 4:
+            print(f"[aruco] only {len(self._anchors)} corner anchors configured (<4) — "
+                  f"no homography can be built; set arena.corner_markers (bl/br/tr/tl)")
         for cam in self._cameras:
-            if len(cam.anchors) < 4:
-                print(f"[aruco] camera {cam.source!r} has {len(cam.anchors)} anchors (<4) — "
-                      f"it cannot build a homography and will report nothing")
             t = threading.Thread(target=self._run_camera, args=(cam,), daemon=True, name=f"aruco-cam-{cam.source}")
             t.start()
             self._threads.append(t)
@@ -196,16 +196,22 @@ class ArucoEngine:
             t.join(timeout=2.0)
         self._threads.clear()
 
-    def get(self, robot_name: str) -> Optional[Pose]:
-        """Latest fresh pose for a robot, or None if not observed within max_pose_age_s."""
+    def get_measurements(self, robot_name: str) -> List[Tuple[Pose, np.ndarray]]:
+        """
+        Every camera's fresh pose for a robot, each with that camera's R.
+
+        Returns a list of (pose, R) — one entry per camera that has seen the robot
+        within max_pose_age_s. Empty if no camera currently sees it. The consumer
+        fuses these in its filter (sequential Kalman updates).
+        """
+        now = time.time()
+        out: List[Tuple[Pose, np.ndarray]] = []
         with self._lock:
-            entry = self._cache.get(robot_name)
-        if entry is None:
-            return None
-        pose, ts, _area, _cam = entry
-        if time.time() - ts > self._max_age:
-            return None
-        return pose
+            per_cam = self._meas.get(robot_name, {})
+            for cam_index, (pose, ts) in per_cam.items():
+                if now - ts <= self._max_age:
+                    out.append((pose, self._cam_R[cam_index]))
+        return out
 
     def get_obstacle_points(self) -> List[Tuple[float, float]]:
         """World (x, y) of every obstacle cube seen within obstacle_max_age_s."""
@@ -213,18 +219,9 @@ class ArucoEngine:
         with self._lock:
             return [xy for xy, ts in self._obstacles.values() if now - ts <= self._obstacle_max_age]
 
-    def _update(self, robot: str, pose: Pose, area: float, now: float, cam_index: int) -> None:
+    def _set_measurement(self, robot: str, cam_index: int, pose: Pose, now: float) -> None:
         with self._lock:
-            prev = self._cache.get(robot)
-            # The SAME camera always refreshes (freshest pose wins). A DIFFERENT
-            # camera only preempts while the current entry is still fresh AND its
-            # view was more head-on (larger marker area) — so with two cameras the
-            # better view is preferred, without ever staling a single-camera feed.
-            if prev is not None:
-                _p, p_ts, p_area, p_cam = prev
-                if p_cam != cam_index and (now - p_ts) <= self._max_age and p_area > area:
-                    return
-            self._cache[robot] = (pose, now, area, cam_index)
+            self._meas.setdefault(robot, {})[cam_index] = (pose, now)
 
     def _update_obstacle(self, marker_id: int, xy: Tuple[float, float], now: float) -> None:
         with self._lock:
@@ -266,8 +263,7 @@ class ArucoEngine:
                         continue
                     x, y, theta = _marker_pose(H, corners)
                     pose = (x, y, _normalize_angle(theta + self._yaw.get(robot, 0.0)))
-                    area = float(cv2.contourArea(corners.astype(np.float32)))
-                    self._update(robot, pose, area, now, cam.index)
+                    self._set_measurement(robot, cam.index, pose, now)
         finally:
             cap.release()
             print(f"[aruco] camera {cam.source!r} released")

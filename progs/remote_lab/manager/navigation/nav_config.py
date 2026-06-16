@@ -1,10 +1,15 @@
 """
 Configuration for the AllGoHome navigation: arena map, per-robot homes/markers,
-controller and filter parameters.
+controller and filter parameters, and the multi-camera ArUco fusion setup.
 
 Stored in manager/navigation/nav_config.json (gitignored — deployment-specific). If
 the file is missing it is created from a template using the default device names, so
 the procedure is runnable out of the box with the simulated pose provider.
+
+Camera model = FUSION: every camera sees the WHOLE arena, so all cameras share the
+same 4 corner anchors, and each camera's pose is an independent measurement fused in
+the Kalman filter (weighted by per-camera r_pos / r_theta). No tiling / per-camera
+anchor subsets.
 
 Units: cells for the grid; metres and radians for the world; m/s and rad/s for
 speeds. One cell == cell_size_m metres.
@@ -18,14 +23,13 @@ from typing import Dict, List, Optional, Set, Tuple
 _CONFIG_PATH = Path(__file__).parent / "nav_config.json"  # manager/navigation/nav_config.json
 
 _TEMPLATE = {
-    "_note": "AllGoHome map & params. SINGLE source of truth = 'arena': set the field "
-             "width_m x height_m, the cell_size_m, and which ArUco id sits in each corner "
-             "(corner_markers: bl/br/tr/tl). The grid AND the anchor world coordinates "
-             "both derive from this — no separate grid/anchor tuning. Place 4 markers at "
-             "the field corners, measure the rectangle through their CENTRES (= width_m x "
-             "height_m), name the corners, done. m/s & rad/s for speeds. provider: "
-             "'simulated' (no camera) or 'aruco' (real cameras). Advanced / 2 cameras: "
-             "give explicit per-camera 'anchors' (id -> [x,y] m) to override the corners.",
+    "_note": "AllGoHome map & params. 'arena' is the SINGLE source of truth: field size, "
+             "cell size, and which ArUco id sits in each corner (corner_markers bl/br/tr/tl). "
+             "The grid AND the anchor world coordinates both derive from it — measure the "
+             "rectangle through the 4 corner-marker centres, name the corners, done. FUSION "
+             "setup: every camera sees the WHOLE arena (so all share the same 4 corner anchors) "
+             "and their poses are fused in the Kalman filter. m/s & rad/s for speeds. "
+             "provider: 'simulated' (no camera) or 'aruco' (real cameras).",
     "provider": "simulated",
     "arena": {
         "width_m": 1.0,
@@ -50,21 +54,21 @@ _TEMPLATE = {
     },
     "obstacles": [],
     "aruco": {
-        "_note": "Real-camera pose source (provider='aruco'). Anchors come from "
-                 "arena.corner_markers by default (their world metres derive from the "
-                 "arena size); >=4 visible in a frame rebuild the homography that frame, "
-                 "so the camera may be moved freely while the anchors stay put and "
-                 "visible. Mount anchor markers at the SAME height as the robot markers to "
-                 "avoid parallax. Override per camera with an explicit 'anchors' map "
-                 "(id -> [x, y] m), e.g. 2 cameras each seeing a different subset. "
-                 "'obstacle_markers' are mapped to grid cells live. Id ranges: robots 1-9, "
+        "_note": "Fusion pose source (provider='aruco'). EVERY camera sees the whole arena and "
+                 "shares the 4 corner anchors from arena.corner_markers (>=4 must be visible per "
+                 "camera to build its homography). Each camera produces one pose per robot; the "
+                 "poses are fused in the UKF, weighted by per-camera r_pos/r_theta (default = "
+                 "noise.r_pos/r_theta; a sharper/closer camera -> smaller R -> more trust). "
+                 "Mount the corner markers at the SAME height as the robot markers (no parallax). "
+                 "obstacle_markers are mapped to grid cells live. Id ranges: robots 1-9, "
                  "anchors 10-19, obstacles 20-49.",
         "dictionary": "DICT_5X5_50",
         "max_pose_age_s": 0.4,
         "obstacle_max_age_s": 3.0,
         "obstacle_markers": [20, 21, 22],
         "cameras": [
-            {"source": 0}
+            {"source": 0},
+            {"source": 1}
         ],
     },
     "robots": {
@@ -83,16 +87,18 @@ class RobotNav:
 
 @dataclass
 class CameraConfig:
-    source: object                              # cv2.VideoCapture source: device index (int) or stream URL (str)
-    anchors: Dict[int, Tuple[float, float]]     # marker_id -> world (x, y) metres of the marker centre (homography)
+    source: object        # cv2.VideoCapture source: device index (int) or stream URL (str)
+    r_pos: float          # measurement noise std (metres) for this camera's pose -> fusion weight
+    r_theta: float        # measurement noise std (radians) for this camera's heading
 
 
 @dataclass
 class ArucoConfig:
     dictionary: str = "DICT_5X5_50"
-    max_pose_age_s: float = 0.4               # a robot pose older than this -> get_pose() returns None
+    max_pose_age_s: float = 0.4               # a robot pose older than this -> dropped from fusion
     obstacle_max_age_s: float = 3.0           # a detected obstacle cube is remembered this long after last seen
     obstacle_markers: List[int] = field(default_factory=list)   # ids treated as dynamic obstacles
+    anchors: Dict[int, Tuple[float, float]] = field(default_factory=dict)   # GLOBAL corner anchors (all cameras share)
     cameras: List[CameraConfig] = field(default_factory=list)
 
 
@@ -169,39 +175,34 @@ def _parse(raw: dict) -> NavConfig:
         for name, r in raw.get("robots", {}).items()
     }
 
-    # Single source of truth: 'arena' gives the field size; grid_w/grid_h and the
-    # corner-anchor world coordinates both derive from it. Legacy fallback: explicit
-    # top-level cell_size_m/grid_w/grid_h (+ explicit per-camera anchors).
-    arena = raw.get("arena")
-    if arena is not None:
-        cell = float(arena.get("cell_size_m", 0.1))
-        width_m = float(arena["width_m"])
-        height_m = float(arena["height_m"])
-        grid_w = max(1, int(round(width_m / cell)))
-        grid_h = max(1, int(round(height_m / cell)))
-        corner_markers = arena.get("corner_markers", {})
-    else:
-        cell = float(raw["cell_size_m"])
-        grid_w = int(raw["grid_w"])
-        grid_h = int(raw["grid_h"])
-        width_m, height_m = grid_w * cell, grid_h * cell
-        corner_markers = {}
+    # 'arena' is the single source of truth: grid size + the corner anchors (shared
+    # by all cameras, since every camera sees the whole arena in the fusion setup).
+    arena = raw["arena"]
+    cell = float(arena.get("cell_size_m", 0.1))
+    width_m = float(arena["width_m"])
+    height_m = float(arena["height_m"])
+    grid_w = max(1, int(round(width_m / cell)))
+    grid_h = max(1, int(round(height_m / cell)))
+    anchors = _corner_anchors(arena.get("corner_markers", {}), width_m, height_m)
 
-    def _camera(c: dict) -> CameraConfig:
-        explicit = c.get("anchors")
-        if explicit:                                  # advanced override (e.g. 2 cameras)
-            anchors = {int(k): tuple(v) for k, v in explicit.items()}
-        else:                                         # derive from arena corners
-            anchors = _corner_anchors(corner_markers, width_m, height_m)
-        return CameraConfig(source=c["source"], anchors=anchors)
-
+    g_r_pos = float(noise.get("r_pos", 0.12))
+    g_r_theta = float(noise.get("r_theta", 0.1))
     araw = raw.get("aruco", {})
+    cameras = [
+        CameraConfig(
+            source=c["source"],
+            r_pos=float(c.get("r_pos", g_r_pos)),       # default to the global measurement noise
+            r_theta=float(c.get("r_theta", g_r_theta)),
+        )
+        for c in araw.get("cameras", [])
+    ]
     aruco = ArucoConfig(
         dictionary=araw.get("dictionary", "DICT_5X5_50"),
         max_pose_age_s=float(araw.get("max_pose_age_s", 0.4)),
         obstacle_max_age_s=float(araw.get("obstacle_max_age_s", 3.0)),
         obstacle_markers=[int(m) for m in araw.get("obstacle_markers", [])],
-        cameras=[_camera(c) for c in araw.get("cameras", [])],
+        anchors=anchors,
+        cameras=cameras,
     )
     return NavConfig(
         provider=raw.get("provider", "simulated"),
@@ -219,8 +220,8 @@ def _parse(raw: dict) -> NavConfig:
         meas_theta_std=float(noise.get("theta_std", 0.05)),
         drop_prob=float(noise.get("drop_prob", 0.04)),
         q_diag=list(noise.get("q_diag", [0.08, 0.08, 0.03])),
-        r_pos=float(noise.get("r_pos", 0.12)),
-        r_theta=float(noise.get("r_theta", 0.1)),
+        r_pos=g_r_pos,
+        r_theta=g_r_theta,
         obstacles=[tuple(o) for o in raw.get("obstacles", [])],
         robots=robots,
         aruco=aruco,

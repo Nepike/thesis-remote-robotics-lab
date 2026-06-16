@@ -1,30 +1,34 @@
 """
-Localization providers: the source of global robot poses (x, y, theta) for the
-AllGoHome procedure.
+Localization providers: the source of global robot pose MEASUREMENTS (x, y, theta)
+for the AllGoHome procedure.
 
 The procedure is written against the abstract LocalizationProvider, so the pose
 source can be swapped without touching the navigation logic.
 
-Currently active: SimulatedLocalizationProvider — advances an internal "true" pose
-per robot from the commanded velocities and returns it with Gaussian noise (and
-occasional dropped frames), exactly like the camera model in the AllGoHome
-simulator. This lets the whole procedure run and be validated end-to-end before the
-cameras exist.
+FUSION model: get_measurements(robot) returns a LIST of (pose, R) — one entry per
+camera that currently sees the robot, each with that camera's measurement-noise
+covariance R. The procedure folds them all into the UKF (sequential updates), so
+more views give a better estimate. A single measurement is just a list of length 1.
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  ArucoLocalizationProvider реализован (потолочные камеры + ArUco + гомография). ║
-║  Чтобы переключиться на реальные камеры: provider="aruco" в nav_config.json и   ║
-║  заполнить секцию "aruco" (камеры + точки калибровки). Логику навигации менять  ║
-║  НЕ нужно — меняется только источник поз. Захват — см. navigation/aruco.py.    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Providers:
+  - SimulatedLocalizationProvider — no cameras. Advances an internal "true" pose
+    per robot from the commanded velocities and returns N independent noisy
+    measurements (N = number of configured cameras, default 2), so the fusion path
+    can be validated end-to-end before the cameras exist.
+  - ArucoLocalizationProvider — real ceiling cameras + ArUco, fused. Switch with
+    "provider": "aruco" in nav_config.json. Capture/homography live in
+    navigation/aruco.py (imported lazily so OpenCV is only needed for the real one).
 """
 
 import math
 import random
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
-Pose = Tuple[float, float, float]  # (x, y, theta) in metres, radians
+import numpy as np
+
+Pose = Tuple[float, float, float]                 # (x, y, theta) in metres, radians
+Measurement = Tuple[Pose, np.ndarray]             # (pose, R 3x3)
 
 
 def _normalize_angle(a: float) -> float:
@@ -32,11 +36,21 @@ def _normalize_angle(a: float) -> float:
 
 
 class LocalizationProvider(ABC):
-    """Abstract source of global robot poses."""
+    """Abstract source of global robot pose measurements (fused downstream)."""
 
     @abstractmethod
+    async def get_measurements(self, robot_name: str) -> List[Measurement]:
+        """
+        All fresh pose measurements for a robot, each as (pose, R).
+
+        One entry per camera that currently sees the robot; empty if unseen. The
+        caller fuses them in its filter.
+        """
+
     async def get_pose(self, robot_name: str) -> Optional[Pose]:
-        """Latest measured pose, or None if the robot is not currently observed."""
+        """Convenience: the first available measurement's pose, or None. (For init.)"""
+        m = await self.get_measurements(robot_name)
+        return m[0][0] if m else None
 
     def register(self, robot_name: str, start_pose: Pose) -> None:
         """Optional init hook (used by the simulated provider to seed true state)."""
@@ -49,12 +63,12 @@ class LocalizationProvider(ABC):
         provider uses it to advance its internal ground truth.
         """
 
-    def get_dynamic_obstacles(self) -> Set[Tuple[int, int]]:
+    def get_dynamic_obstacles(self):
         """
         Grid cells currently occupied by camera-detected obstacles (ArUco cubes).
 
-        Merged with the static config obstacles by the procedure at planning time.
-        Empty for sources that cannot see obstacles (e.g. the simulated provider).
+        Merged (and inflated) with the static config obstacles by the procedure at
+        planning time. Empty for sources that cannot see obstacles (e.g. simulated).
         """
         return set()
 
@@ -67,13 +81,16 @@ class SimulatedLocalizationProvider(LocalizationProvider):
     Placeholder pose source for development without cameras.
 
     Keeps a "true" pose per robot, advances it by the unicycle model using the
-    commanded (v, omega), and returns a noisy measurement — mirroring the simulator
-    camera model (Gaussian noise + MEAS_DROP_PROB dropped frames).
+    commanded (v, omega), and returns N independent noisy measurements per tick
+    (N = number of configured cameras, default 2) — mirroring N cameras that each
+    observe the same robot, so the fusion path is exercised exactly as in reality.
     """
 
     def __init__(self, cfg):
         self.cfg = cfg
         self._truth: Dict[str, List[float]] = {}
+        self._n_cams = max(1, len(cfg.aruco.cameras))
+        self._R = np.diag([cfg.r_pos, cfg.r_pos, cfg.r_theta]) ** 2
 
     def register(self, robot_name: str, start_pose: Pose) -> None:
         self._truth[robot_name] = [float(start_pose[0]), float(start_pose[1]), float(start_pose[2])]
@@ -88,47 +105,51 @@ class SimulatedLocalizationProvider(LocalizationProvider):
         th = _normalize_angle(th + omega * dt)
         self._truth[robot_name] = [x, y, th]
 
-    async def get_pose(self, robot_name: str) -> Optional[Pose]:
+    async def get_measurements(self, robot_name: str) -> List[Measurement]:
         st = self._truth.get(robot_name)
         if st is None:
-            return None
-        if random.random() < self.cfg.drop_prob:
-            return None  # dropped frame -> filter skips its update step
+            return []
         x, y, th = st
-        return (
-            x + random.gauss(0.0, self.cfg.meas_pos_std),
-            y + random.gauss(0.0, self.cfg.meas_pos_std),
-            _normalize_angle(th + random.gauss(0.0, self.cfg.meas_theta_std)),
-        )
+        out: List[Measurement] = []
+        for _ in range(self._n_cams):
+            if random.random() < self.cfg.drop_prob:
+                continue  # this "camera" dropped the frame
+            pose = (
+                x + random.gauss(0.0, self.cfg.meas_pos_std),
+                y + random.gauss(0.0, self.cfg.meas_pos_std),
+                _normalize_angle(th + random.gauss(0.0, self.cfg.meas_theta_std)),
+            )
+            out.append((pose, self._R))
+        return out
 
     def describe(self) -> str:
-        return "SimulatedLocalizationProvider (ПЛЕЙСХОЛДЕР — заменить на ArUco)"
+        return f"SimulatedLocalizationProvider (ПЛЕЙСХОЛДЕР, {self._n_cams} вирт. камеры — заменить на ArUco)"
 
 
 class ArucoLocalizationProvider(LocalizationProvider):
     """
-    Real pose source: ceiling camera(s) + ArUco markers, mapped to arena metres by
-    a per-camera homography (planar scene, no intrinsic calibration required).
+    Real pose source: multiple ceiling cameras + ArUco, FUSED. Every camera sees the
+    whole arena and shares the 4 corner anchors; each camera's pose is one fused
+    measurement.
 
     Construction starts a background capture/detection engine (one thread per
-    camera) that keeps a per-robot pose cache up to date; get_pose() just reads it.
-    The heavy lifting (OpenCV, threads, homography) lives in navigation/aruco.py,
-    imported lazily here so the simulated provider works without OpenCV installed.
+    camera) that keeps per-(robot, camera) measurements up to date;
+    get_measurements() just reads them. The heavy lifting (OpenCV, threads,
+    homography) lives in navigation/aruco.py, imported lazily here so the simulated
+    provider works without OpenCV installed.
 
-    Designed to be a long-lived singleton (see build_localization_provider): the
-    cameras open once and the engine runs for the whole server lifetime, regardless
-    of how many times AllGoHome is invoked. apply_command stays a no-op — the
-    cameras observe the robots' actual motion.
+    Long-lived singleton (see build_localization_provider): cameras open once and
+    the engine runs for the whole server lifetime. apply_command stays a no-op —
+    the cameras observe the robots' actual motion.
 
     Configuration (nav_config.json):
-      - aruco.dictionary / aruco.max_pose_age_s / aruco.cameras[] (source + the
-        pixel<->metre calibration points);
+      - arena.corner_markers -> the shared anchors; aruco.cameras[] (source + optional
+        r_pos/r_theta fusion weight); aruco.dictionary / max_pose_age_s / obstacle_*;
       - per robot: marker_id (which tag) and marker_yaw_offset (mounting rotation).
     """
 
     def __init__(self, cfg):
         self.cfg = cfg
-        # marker_id -> robot_name, and robot_name -> mounting yaw offset (radians).
         self._marker_to_robot = {
             r.marker_id: name for name, r in cfg.robots.items() if r.marker_id is not None
         }
@@ -145,15 +166,15 @@ class ArucoLocalizationProvider(LocalizationProvider):
         self._engine = ArucoEngine(cfg.aruco, self._marker_to_robot, yaw_by_robot)
         self._engine.start()
 
-    async def get_pose(self, robot_name: str) -> Optional[Pose]:
-        # Reading the cache is non-blocking; the blocking camera I/O runs in the
+    async def get_measurements(self, robot_name: str) -> List[Measurement]:
+        # Reading the caches is non-blocking; the blocking camera I/O runs in the
         # engine's own threads, so this never stalls the event loop.
-        return self._engine.get(robot_name)
+        return self._engine.get_measurements(robot_name)
 
-    def get_dynamic_obstacles(self) -> Set[Tuple[int, int]]:
+    def get_dynamic_obstacles(self):
         """Map every freshly-seen obstacle cube to the grid cell it sits in."""
         cell = self.cfg.cell_size_m
-        cells: Set[Tuple[int, int]] = set()
+        cells = set()
         for x, y in self._engine.get_obstacle_points():
             cx = min(max(int(x // cell), 0), self.cfg.grid_w - 1)
             cy = min(max(int(y // cell), 0), self.cfg.grid_h - 1)
@@ -166,7 +187,7 @@ class ArucoLocalizationProvider(LocalizationProvider):
 
     def describe(self) -> str:
         return (
-            f"ArucoLocalizationProvider ({len(self.cfg.aruco.cameras)} camera(s), "
+            f"ArucoLocalizationProvider (fusion of {len(self.cfg.aruco.cameras)} camera(s), "
             f"{self.cfg.aruco.dictionary})"
         )
 

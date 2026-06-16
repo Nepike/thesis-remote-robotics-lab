@@ -202,11 +202,11 @@ class AllGoHome(AbstractProcedure):
                 manager.release_device(name, client_id)
 
     async def _first_fix(self, loc, name, dt, tries=20):
-        """Wait for the first non-dropped localization measurement."""
+        """Wait for the first localization fix; return one pose to seed the filter."""
         for _ in range(tries):
-            pose = await loc.get_pose(name)
-            if pose is not None:
-                return pose
+            measurements = await loc.get_measurements(name)
+            if measurements:
+                return measurements[0][0]
             await asyncio.sleep(dt)
         return None
 
@@ -250,9 +250,13 @@ class AllGoHome(AbstractProcedure):
             driver.set_velocity(v, omega)            # real command (direct velocity stream)
             loc.apply_command(name, v, omega, cfg.dt)  # advance simulated truth (no-op for real ArUco)
 
-            meas = await loc.get_pose(name)          # noisy pose now / real camera later
+            # Fusion: predict once, then fold in EVERY camera's measurement (each with
+            # its own R). Sequential Kalman updates combine optimally; if no camera
+            # sees the robot this tick the list is empty and we coast on predict.
+            measurements = await loc.get_measurements(name)
             ukf.predict((v, omega), cfg.dt)
-            ukf.update(meas)                         # update() ignores None (dropped frame)
+            for z, R in measurements:
+                ukf.update(z, R)
 
             if ctrl.reached(ukf.x[0], ukf.x[1]):
                 driver.set_velocity(0.0, 0.0)
