@@ -1,3 +1,15 @@
-# Diploma drafting scratch space — not part of the deliverable
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+virtualenv/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Thesis drafting scratch space, not part of the deliverable ---
 slop/
-progs/remote_lab/.idea/

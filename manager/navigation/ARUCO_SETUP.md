@@ -14,7 +14,7 @@
 
 ## 0. Зависимости
 ```bash
-cd progs/remote_lab/manager
+cd manager
 pip install -r requirements.txt          # включает opencv-contrib-python
 pip install matplotlib                    # только для визуального теста
 python -c "import cv2, cv2.aruco; print(cv2.__version__)"
@@ -29,7 +29,7 @@ python -c "import cv2, cv2.aruco; print(cv2.__version__)"
 | Якоря (опорные) | 10–19 | строят гомографию; их мировые координаты — в конфиге |
 | Препятствия | 20–49 | их клетка добавляется в `blocked` для A* |
 
-Все из одного словаря `DICT_5X5_50`. Генерация листов A4 (из `progs/remote_lab/manager`):
+Все из одного словаря `DICT_5X5_50`. Генерация листов A4 (из `manager`):
 ```bash
 python navigation/make_markers.py --id 1 --id 10 --id 11 --id 12 --id 13 --id 20 --id 21 --id 22
 # -> navigation/markers/markers_pageNN.png + markers.pdf (PDF: pip install pillow)
@@ -144,7 +144,7 @@ python navigation/aruco_test.py --robot Test-device-1 --headless
 
 ## 7. Боевой режим
 1. `"provider": "aruco"` в конфиге.
-2. `cd progs/remote_lab/manager && python network/server.py`
+2. `cd manager && python network/server.py`
    В логе: `[aruco] camera 0 opened` / `camera 1 opened`, при запуске процедуры —
    `localization = ArucoLocalizationProvider (fusion of 2 camera(s), DICT_5X5_50)`.
 3. Клиентом запусти `all_go_home`. A* объедет статические препятствия + кубы +
