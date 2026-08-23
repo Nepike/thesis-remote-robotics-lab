@@ -5,8 +5,8 @@ take out locks on physical devices, queue commands with priorities, stream telem
 launch group manoeuvres that run entirely server-side. Overhead cameras track every robot by
 ArUco marker, so the server always knows where things actually are.
 
-> Undergraduate thesis project, MIPT, 2026. The written thesis (in Russian) is in
-> [`docs/thesis-ru.pdf`](docs/thesis-ru.pdf).
+> Bachelor's thesis project, MIPT, 2026. The thesis itself (in Russian) is in
+> [`docs/bachelor-thesis-shchuchkin-ru.pdf`](docs/bachelor-thesis-shchuchkin-ru.pdf).
 
 ## The problem
 
@@ -80,7 +80,7 @@ Setup, marker ID allocation and printing are documented in
 | `firmware/yarp13-mega/` | Robot firmware: motor PID, encoders, compass, rangefinders, servos, reflex stop |
 | `firmware/esp32-gateway/` | Wi-Fi gateway between the robot and the server |
 | `firmware/custom-protocol/` | A binary serial protocol with typed arguments and CRC, plus master/slave examples |
-| `docs/` | The thesis |
+| `docs/` | The thesis, and host setup instructions |
 
 ### The wire protocol
 
@@ -92,9 +92,12 @@ of the project closest to plain embedded C++.
 
 ## Running it
 
-The server needs ROS Noetic on Ubuntu 20.04 and a camera. The ROS workspace itself belongs to
-the laboratory and is not redistributed here; the drivers expect it built at `~/ros`, and
-source it as `~/ros/devel/setup.bash`.
+The server needs ROS Noetic on Ubuntu 20.04 and a camera. Full host setup — ROS, the catkin
+workspace, shell configuration — is in [`docs/ros-setup.md`](docs/ros-setup.md).
+
+The catkin workspace belongs to the laboratory rather than to me, so it is not tracked here.
+It ships as a release asset (`ros-workspace.tar.gz`) so that cloning this repository stays
+cheap; the drivers expect it unpacked and built at `~/ros`.
 
 ```bash
 cd manager
@@ -135,8 +138,8 @@ after which the client's command catalogue picks it up without touching client l
 
 ## Notes
 
-- The ROS workspace is the laboratory's, not mine, and is not included. Everything in this
-  repository is my own work.
+- The ROS workspace is the laboratory's, not mine. It is distributed as a release asset
+  rather than tracked here. Everything in this repository is my own work.
 - Comments and inline documentation are a mix of English and Russian.
 - There is no automated test suite; the system was validated against the physical lab, and
   `sync_test` exists partly as a smoke test you can run on real hardware.
