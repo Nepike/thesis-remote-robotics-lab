@@ -13,3 +13,6 @@ Thumbs.db
 
 # --- Thesis drafting scratch space, not part of the deliverable ---
 slop/
+
+# --- Claude Code session data (worktrees, local settings) ---
+.claude/
