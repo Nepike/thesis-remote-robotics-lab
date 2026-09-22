@@ -91,6 +91,15 @@ class StopAll(AbstractProcedure):
     which drives robots via a direct velocity loop outside the scheduler) is
     cancelled, so its teardown stops the robots. This procedure excludes itself.
 
+    Step 4 — emergency_stop_all: publish a physical stop on EVERY actuator channel
+    of every device. Steps 1-3 only stop things that are *running under the
+    scheduler*; an actuator left latched by a completed command keeps going. The
+    clearest case is a HOLD setpoint (dctl without `duration`): the command itself
+    finished long ago, so there is nothing to cancel or interrupt, yet the wheels
+    are still turning. Without this step the only backstop is the firmware watchdog
+    — which is ~2 s and sits behind the SW_CONNECT toggle. So E-stop must reach the
+    actuators directly.
+
     No device locks are acquired - this procedure is intentionally privileged.
     """
 
@@ -100,6 +109,8 @@ class StopAll(AbstractProcedure):
         manager.cancel_all_commands()
         manager.interrupt_all_devices()
         manager.cancel_all_procedures(except_client=client_id)
+        # Last, so nothing cancelled above can publish a setpoint after the stop.
+        manager.emergency_stop_all()
 
 
 class AllGoHome(AbstractProcedure):
@@ -148,7 +159,11 @@ class AllGoHome(AbstractProcedure):
             await logger.log("PROC", "all_go_home: nav_config.json has no robots — configure homes")
             return
 
-        loc = build_localization_provider(cfg)
+        # Building the ArUco provider OPENS THE CAMERAS (cv2.VideoCapture), which
+        # blocks for a noticeable time on the first run. Off-load it to a thread so
+        # the event loop — telemetry, WebSockets, every other device — keeps running.
+        loop = asyncio.get_running_loop()
+        loc = await loop.run_in_executor(None, build_localization_provider, cfg)
         await logger.log("PROC", f"all_go_home: localization = {loc.describe()}")
 
         # Only active devices that are configured with a home cell.
@@ -182,10 +197,12 @@ class AllGoHome(AbstractProcedure):
             for name in acquired:
                 # All OTHER robots are stationary now -> treat their cells as obstacles.
                 others = {positions[o] for o in acquired if o != name}
-                ok = await self._drive_robot(manager, loc, cfg, name, others, logger)
-                (home if ok else failed).append(name)
-                # This robot is now parked at its home cell (an obstacle for the rest).
-                positions[name] = tuple(cfg.robots[name].home)
+                reached, final_cell = await self._drive_robot(manager, loc, cfg, name, others, logger)
+                (home if reached else failed).append(name)
+                # This robot is parked now and becomes an obstacle for the rest. Record
+                # where it ACTUALLY stopped: one that failed stands wherever it gave up,
+                # not on its home cell, and the others must route around it there.
+                positions[name] = final_cell
             await logger.log("PROC", f"all_go_home: reached={home} failed={failed}")
             if failed:
                 raise RuntimeError(f"Did not reach home: {failed}")
@@ -211,17 +228,27 @@ class AllGoHome(AbstractProcedure):
         return None
 
     async def _drive_robot(self, manager, loc, cfg, name, other_cells, logger):
-        """Drive one robot home, avoiding static obstacles + `other_cells` (the
-        current cells of the other, stationary robots). Returns (name, reached)."""
+        """
+        Drive one robot home, avoiding static obstacles + `other_cells` (the current
+        cells of the other, stationary robots).
+
+        Returns (reached, final_cell): whether home was reached, and the cell the
+        robot is standing on now. The caller feeds final_cell back into the obstacle
+        set for the robots that go next, so a robot that failed mid-field is routed
+        around where it really is.
+        """
+        # Where the robot sits if we cannot even start — its configured start cell.
+        start_cfg_cell = (int(cfg.robots[name].start[0]), int(cfg.robots[name].start[1]))
+
         driver = manager.get_driver(name)
         if driver is None or not hasattr(driver, "set_velocity"):
             await logger.log("PROC", f"all_go_home: '{name}' has no velocity control — skipped")
-            return (name, False)
+            return (False, start_cfg_cell)
 
         fix = await self._first_fix(loc, name, cfg.dt)
         if fix is None:
             await logger.log("PROC", f"all_go_home: '{name}' no localization fix")
-            return (name, False)
+            return (False, start_cfg_cell)
 
         Q = np.diag(cfg.q_diag) ** 2
         R = np.diag([cfg.r_pos, cfg.r_pos, cfg.r_theta]) ** 2
@@ -238,7 +265,7 @@ class AllGoHome(AbstractProcedure):
         path = a_star(start_cell, home_cell, blocked, cfg.grid_w, cfg.grid_h)
         if not path:
             await logger.log("PROC", f"all_go_home: '{name}' no path {start_cell} -> {home_cell}")
-            return (name, False)
+            return (False, start_cell)
 
         ctrl = WaypointController(path, cfg)
         max_steps = max(1, int(cfg.max_time_s / cfg.dt))
@@ -255,19 +282,20 @@ class AllGoHome(AbstractProcedure):
             # sees the robot this tick the list is empty and we coast on predict.
             measurements = await loc.get_measurements(name)
             ukf.predict((v, omega), cfg.dt)
-            for z, R in measurements:
-                ukf.update(z, R)
+            for z, cam_R in measurements:
+                ukf.update(z, cam_R)
 
             if ctrl.reached(ukf.x[0], ukf.x[1]):
                 driver.set_velocity(0.0, 0.0)
                 await logger.log("PROC", f"all_go_home: '{name}' reached home")
-                return (name, True)
+                return (True, tuple(home_cell))
 
             await asyncio.sleep(cfg.dt)
 
         driver.set_velocity(0.0, 0.0)
-        await logger.log("PROC", f"all_go_home: '{name}' timed out before home")
-        return (name, False)
+        stalled_cell = world_to_cell(ukf.x[0], ukf.x[1], cfg)
+        await logger.log("PROC", f"all_go_home: '{name}' timed out before home at {stalled_cell}")
+        return (False, stalled_cell)
 
 
 class SyncTest(AbstractProcedure):

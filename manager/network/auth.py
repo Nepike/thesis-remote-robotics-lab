@@ -19,13 +19,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-
-
 _ALGORITHM  = "sha256"
 _ITERATIONS = 260_000
-_security   = HTTPBasic()
 
 
 def _hash_password(password: str) -> str:
@@ -91,22 +86,10 @@ def verify_credentials(username: str, password: str) -> bool:
     return _store.verify(username, password)
 
 
-# def get_client_id(credentials: HTTPBasicCredentials = Depends(_security)) -> str:
-#     """
-#     FastAPI dependency that validates HTTP Basic Auth and returns the username
-#     as client_id. Use in route handlers: `client_id: str = Depends(get_client_id)`.
-#     """
-#     if _store is None:
-#         raise RuntimeError("UserStore not initialised — call init_user_store() first")
-#
-#     if not _store.verify(credentials.username, credentials.password):
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Invalid credentials",
-#             headers={"WWW-Authenticate": "Basic"},
-#         )
-#
-#     return credentials.username
+# NB: there is deliberately no FastAPI HTTPBasic dependency here. The only
+# authenticated route is the WebSocket upgrade, and HTTPBasic.__call__ expects a
+# Request, not a WebSocket — so the header is parsed by hand in
+# ws_handler._parse_basic_auth, which calls verify_credentials() above.
 
 
 # CLI

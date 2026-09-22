@@ -13,6 +13,19 @@ from ._connection import (
 )
 
 
+# asyncio holds only a WEAK reference to a running task, so a task nobody keeps
+# can be garbage collected mid-flight — a cancel() would then silently never
+# reach the server. Parking them here keeps them alive until they finish.
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule a coroutine without awaiting it, keeping a strong reference."""
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 class CommandHandle:
     """
     Handle for a submitted command. Returned by submit().
@@ -43,8 +56,18 @@ class CommandHandle:
 
     @property
     def done(self) -> bool:
-        """True if all targeted devices have reported 'done'."""
+        """True if all targeted devices have settled this command."""
         return self._pending.done
+
+    @property
+    def cancelled(self) -> bool:
+        """
+        True if the command was dropped from the queue before it ever ran.
+
+        `await cmd` returns normally in that case — the command settled, it just
+        never reached the robot — so check this when the difference matters.
+        """
+        return self._pending.cancelled
 
     def cancel(self):
         """
@@ -52,7 +75,7 @@ class CommandHandle:
         Has no effect if the command is already executing.
         To stop an executing command use device.interrupt() instead.
         """
-        asyncio.create_task(self._conn.cancel(self._pending.command_id))
+        _fire_and_forget(self._conn.cancel(self._pending.command_id))
 
     async def wait(self, timeout: Optional[float] = None):
         """
@@ -101,7 +124,7 @@ class ProcedureHandle:
 
     def cancel(self):
         """Ask the server to cancel this procedure (no await)."""
-        asyncio.create_task(self._conn.cancel_procedure(self._pending.procedure_id))
+        _fire_and_forget(self._conn.cancel_procedure(self._pending.procedure_id))
 
     async def wait(self, timeout: Optional[float] = None):
         """

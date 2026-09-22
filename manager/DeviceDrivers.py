@@ -103,6 +103,21 @@ class AbstractDriver(ABC):
         # Subclasses that override this must call super().teardown_telemetry().
         self._online = False
 
+    def emergency_stop(self) -> None:
+        """
+        Bring EVERY actuator of this device to a halt, right now.
+
+        Called by the stop_all procedure as the final step. Unlike a "stop" command
+        this does NOT go through the scheduler: the queue may be paused (device
+        restarting) or the actuator may be latched by a command that has already
+        returned — a HOLD setpoint being the obvious case, where there is no running
+        coroutine left to interrupt yet the wheels keep turning.
+
+        Must be synchronous and must not raise: it runs on the emergency path.
+        Default is a no-op so a driver with no actuators needs no implementation.
+        """
+        pass
+
     def get_telemetry(self) -> Optional[Any]:
         """Return the latest received telemetry snapshot, or None if nothing has arrived yet."""
         return self._latest_telemetry
@@ -400,6 +415,53 @@ class Yarp13Driver(RosBasedDriver):
             await self._stream(topic, msg_type, stop_message, self._STOP_TAIL_S)
 
         self._tails[channel] = asyncio.create_task(_deadman())
+
+    # Reserved tail slot for the E-stop burst. Not a real actuator channel, so no
+    # incoming command can ever cancel it via _channel_of() — an emergency stop
+    # must not be revoked by whatever arrives next.
+    _ESTOP_CHANNEL: str = "__estop__"
+
+    def emergency_stop(self) -> None:
+        """
+        Halt every actuator: wheels (both the cmd_vel and the direct-PWM paths),
+        the beeper and the gun. See AbstractDriver.emergency_stop.
+
+        Kills all running tails/deadmen first so nothing re-arms motion behind us,
+        publishes one stop frame per actuator immediately, then keeps re-publishing
+        them in the background for _STOP_TAIL_S — a single dropped frame on the
+        rosserial link must not be what leaves a motor running.
+        """
+        Twist = geometry_msgs.msg.Twist
+        Cmd   = msg_yy.msg.cmd
+        cmd_vel = self._topic("cmd_vel")
+        yy_cmd  = self._topic("yy_command")
+
+        for channel in list(self._tails):
+            self._cancel_tail(channel)
+
+        stops = [(cmd_vel, Twist, Twist())]
+        for name in ("dctl", "pidctl"):          # zero the wheels on the direct paths too
+            msg = Cmd()
+            msg.command = self._CMD[name]
+            msg.arg     = [0.0, 0.0]
+            stops.append((yy_cmd, Cmd, msg))
+        for name in ("beep_off", "gun_off"):
+            msg = Cmd()
+            msg.command = self._CMD[name]
+            stops.append((yy_cmd, Cmd, msg))
+
+        for topic, msg_type, message in stops:
+            self._ros.publish(topic, msg_type, message)
+
+        self._tails[self._ESTOP_CHANNEL] = asyncio.create_task(self._estop_tail(stops))
+
+    async def _estop_tail(self, stops):
+        """Re-publish the E-stop frames at _STREAM_HZ for _STOP_TAIL_S."""
+        period = 1.0 / self._STREAM_HZ
+        for _ in range(max(1, int(round(self._STOP_TAIL_S / period)))):
+            await asyncio.sleep(period)
+            for topic, msg_type, message in stops:
+                self._ros.publish(topic, msg_type, message)
 
     async def setup_publishers(self):
         ns = self._device.ros_namespace.strip("/")

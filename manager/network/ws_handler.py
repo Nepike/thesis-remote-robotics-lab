@@ -167,18 +167,27 @@ class ConnectionManager:
         self._command_owners[command_id]  = client_id
         self._command_pending[command_id] = num_devices
 
-    async def on_command_complete(self, command: Command, device_name: str) -> None:
+    async def on_command_complete(self, command: Command, device_name: str, executed: bool = True) -> None:
         """
-        Called by RemoteLabManager._on_execute_command() after execute_command() returns.
+        Called by RemoteLabManager._on_command_settled() once per (command, device),
+        whether the command ran or was skipped because it had been cancelled.
 
-        Sends a DoneMessage to the client that submitted the command.
-        When all targeted devices have finished, cleans up the tracking entries.
+        Sends a DoneMessage to the client that submitted the command, and cleans up
+        the tracking entries once every targeted device has reported in.
+
+        Firing on settlement rather than on execution is what keeps a cancelled
+        command from hanging `await cmd` on the client forever — and keeps
+        _command_owners / _command_pending from leaking an entry per cancellation.
         """
         client_id = self._command_owners.get(command.command_id)
         if client_id:
             session = self._sessions.get(client_id)
             if session:
-                await session.send(DoneMessage(command_id=command.command_id, device=device_name))
+                await session.send(DoneMessage(
+                    command_id=command.command_id,
+                    device=device_name,
+                    status="completed" if executed else "cancelled",
+                ))
 
         remaining = self._command_pending.get(command.command_id, 1) - 1
         if remaining <= 0:
@@ -265,7 +274,12 @@ async def _handle_interrupt(session: ClientSession, msg: InterruptMessage) -> No
 async def _handle_subscribe(session: ClientSession, msg: SubscribeTelemetryMessage) -> None:
     driver = _manager.get_driver(msg.device)
     if driver is None:
-        await session.send(ErrorMessage(code="UNKNOWN_DEVICE", message=f"Unknown device: '{msg.device}'"))
+        # NOT "UNKNOWN_DEVICE": the client correlates errors to requests by FIFO
+        # order per error code, so reusing the submit codes here would make a bad
+        # subscribe fail whatever submit happens to be in flight. Distinct code =
+        # distinct queue. (The real fix is a request_id on every message; that
+        # comes with the control-plane protocol work.)
+        await session.send(ErrorMessage(code="SUBSCRIBE_FAILED", message=f"Unknown device: '{msg.device}'"))
         return
     await session.subscribe_telemetry(msg.device, driver)
 

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 
 from BasicClasses import Device
 from DeviceDrivers import AbstractDriver
@@ -33,6 +33,10 @@ class DeviceSupervisor:
         self._devices: Dict[Device, DeviceSupervisor._DeviceState] = {}
         self._running = False
         self._watchdog_task: Optional[asyncio.Task] = None
+        # Strong refs to in-flight restart tasks — asyncio keeps only a weak one,
+        # so an unreferenced restart could be collected half-way and leave the
+        # device down with its scheduler queue paused forever.
+        self._restart_tasks: Set[asyncio.Task] = set()
 
         # Optional hooks wired up by RemoteLabManager to integrate with CommandScheduler.
         # Called with device.name when a device goes down / comes back up.
@@ -135,7 +139,9 @@ class DeviceSupervisor:
 
                 if not state.transports_alive() or not state.adapters_alive():
                     await logger.log("SUPERVISOR", f"Process died for '{device.name}', restarting...")
-                    asyncio.create_task(self._safe_restart(device, state))
+                    task = asyncio.ensure_future(self._safe_restart(device, state))
+                    self._restart_tasks.add(task)
+                    task.add_done_callback(self._restart_tasks.discard)
 
             await asyncio.sleep(2)
 

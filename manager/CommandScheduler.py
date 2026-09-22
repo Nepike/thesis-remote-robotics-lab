@@ -25,8 +25,9 @@ class CommandScheduler:
         # Optional sync hook called exactly once per (command, device) as soon as
         # the command leaves the device's queue for good — whether it executed,
         # was skipped because it was cancelled, or errored. Lets the manager
-        # release server-side waiters even when a command never runs.
-        self.on_command_settled: Optional[Callable[[Command, str], None]] = None
+        # release server-side waiters AND remote clients even when a command
+        # never runs. The third argument is False for a command that was skipped.
+        self.on_command_settled: Optional[Callable[[Command, str, bool], None]] = None
 
         self._device_queues: Dict[str, asyncio.PriorityQueue] = {}
         self._workers: Dict[str, asyncio.Task] = {}
@@ -212,6 +213,7 @@ class CommandScheduler:
             #    This covers the restart window: the command is already out of
             #    the queue (priority order is preserved) but won't execute
             #    until the device comes back up.
+            executed = False
             try:
                 await ready.wait()
 
@@ -222,7 +224,10 @@ class CommandScheduler:
                     )
                 else:
                     # Run as a sub-task so it can be canceled via interrupt_device()
-                    # without cancelling the worker itself.
+                    # without cancelling the worker itself. From here on the command
+                    # counts as executed — it reached the driver, so the client gets
+                    # a completion even if it is interrupted half-way.
+                    executed = True
                     exec_task = asyncio.create_task(self._execute_callback(command, device_name))
                     self._current_exec_tasks[device_name] = exec_task
                     try:
@@ -262,7 +267,7 @@ class CommandScheduler:
                 # Settle the command for external waiters (manager), regardless of
                 # whether it executed, was skipped (cancelled), or errored.
                 if self.on_command_settled:
-                    self.on_command_settled(command, device_name)
+                    self.on_command_settled(command, device_name, executed)
 
     def _on_command_done(self, command: Command):
         """

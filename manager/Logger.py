@@ -14,6 +14,10 @@ class Logger:
 
     def __init__(self):
         self._lock = asyncio.Lock()
+        # Strong refs to the per-stream pump tasks: asyncio only holds a weak one,
+        # so an unreferenced task can be garbage collected while still running and
+        # the subprocess log would just stop halfway through.
+        self._stream_tasks: set = set()
         self._LOG_DIR.mkdir(parents=True, exist_ok=True)
         # The Logger is a process-wide singleton created once at server start, so
         # wiping existing *.log files here means every server run begins with empty
@@ -41,7 +45,9 @@ class Logger:
         Pipe a subprocess output stream into logs/<prefix>.log (NOT the console).
         Keeps noisy socat / rosserial output off-screen but available on disk.
         """
-        asyncio.create_task(self._log_stream(prefix, stream))
+        task = asyncio.ensure_future(self._log_stream(prefix, stream))
+        self._stream_tasks.add(task)
+        task.add_done_callback(self._stream_tasks.discard)
 
     async def _log_stream(self, prefix: str, stream: asyncio.StreamReader):
         log_path = self._LOG_DIR / f"{prefix}.log"

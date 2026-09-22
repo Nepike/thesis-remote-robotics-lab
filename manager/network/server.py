@@ -43,6 +43,10 @@ _USERS_JSON   = _BASE_DIR / "users.json"
 # must survive code updates). If they are absent on a fresh checkout, the server
 # writes these templates so the operator sees the expected schema, then stops
 # because an empty config has nothing to serve.
+# "shared": false means a client must acquire() the device before it may command
+# it. Anything with actuators wants this: with "shared": true AccessController
+# lets every check_access() through, so two clients (or two procedures) can drive
+# the same robot at the same time. Reserve "shared": true for read-only devices.
 _DEVICES_TEMPLATE = [
     {
         "name": "example-robot",
@@ -51,7 +55,7 @@ _DEVICES_TEMPLATE = [
         "driver": "yarp13",
         "ros_namespace": "robot1/example",
         "baud_rate": None,
-        "shared": True,
+        "shared": False,
         "active": False,
     }
 ]

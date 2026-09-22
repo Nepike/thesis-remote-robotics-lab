@@ -54,34 +54,37 @@ async def main():
             print("Телеметрия не пришла.")
             return
 
-        moved_ok = 0
-        stopped_ok = 0
-        for i in range(1, N_TRIALS + 1):
-            # Старт вращения на месте
-            cmd = await robot.submit(
-                "move", priority=5, speed_lin=0.0, speed_ang=1.0, duration=MOVE_SEC,
-            )
+        # Тест шлёт команды, поэтому захватываем устройство. Для shared-устройств
+        # lock() — no-op, для эксклюзивных без него сервер ответит ACCESS_DENIED.
+        async with robot.lock():
+            moved_ok = 0
+            stopped_ok = 0
+            for i in range(1, N_TRIALS + 1):
+                # Старт вращения на месте
+                cmd = await robot.submit(
+                    "move", priority=5, speed_lin=0.0, speed_ang=1.0, duration=MOVE_SEC,
+                )
 
-            # Замер В ПРОЦЕССЕ движения
-            await asyncio.sleep(MOVE_SEC * 0.5)
-            pl, pr = _pwm(robot)
-            moving = (pl != 0 or pr != 0)
+                # Замер В ПРОЦЕССЕ движения
+                await asyncio.sleep(MOVE_SEC * 0.5)
+                pl, pr = _pwm(robot)
+                moving = (pl != 0 or pr != 0)
 
-            await cmd                      # дождаться завершения move
-            await asyncio.sleep(SETTLE)    # дать стоп-хвосту отработать
+                await cmd                      # дождаться завершения move
+                await asyncio.sleep(SETTLE)    # дать стоп-хвосту отработать
 
-            # Замер ПОСЛЕ остановки
-            pl2, pr2 = _pwm(robot)
-            stopped = (pl2 == 0 and pr2 == 0)
+                # Замер ПОСЛЕ остановки
+                pl2, pr2 = _pwm(robot)
+                stopped = (pl2 == 0 and pr2 == 0)
 
-            moved_ok += 1 if moving else 0
-            stopped_ok += 1 if stopped else 0
+                moved_ok += 1 if moving else 0
+                stopped_ok += 1 if stopped else 0
 
-            mv = "движется" if moving else "НЕ ДВИЖЕТСЯ"
-            st = "ОСТАНОВИЛСЯ" if stopped else "!!! НЕ ОСТАНОВИЛСЯ !!!"
-            print(f"#{i:2d}: во время move pwm=({pl},{pr}) [{mv}]  ->  после: pwm=({pl2},{pr2}) [{st}]")
+                mv = "движется" if moving else "НЕ ДВИЖЕТСЯ"
+                st = "ОСТАНОВИЛСЯ" if stopped else "!!! НЕ ОСТАНОВИЛСЯ !!!"
+                print(f"#{i:2d}: во время move pwm=({pl},{pr}) [{mv}]  ->  после: pwm=({pl2},{pr2}) [{st}]")
 
-            await asyncio.sleep(QUIET_GAP)
+                await asyncio.sleep(QUIET_GAP)
 
         print("\n================ ИТОГ ================")
         print(f"Движение запустилось: {moved_ok}/{N_TRIALS}")

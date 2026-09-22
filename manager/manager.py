@@ -1,7 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from AccessController import AccessController
 from BasicClasses import Command, Device
@@ -50,14 +50,20 @@ class RemoteLabManager:
         # Used by procedures to await command completion server-side.
         self._command_waiters: Dict[str, Tuple[asyncio.Event, int]] = {}
 
+        # Strong references to fire-and-forget tasks. asyncio keeps only a WEAK
+        # reference to a running task, so a task nobody holds can be garbage
+        # collected mid-flight and silently never finish.
+        self._bg_tasks: Set[asyncio.Task] = set()
+
         self._procedure_manager = ProcedureManager(self)
         self._procedure_manager.register(StopAll())
         self._procedure_manager.register(AllGoHome())
         self._procedure_manager.register(SyncTest())
 
-        # Wired by the network layer after startup.
-        # Called with (command, device_name) after every execute_command() returns.
-        self.on_command_complete: Optional[Callable[[Command, str], Awaitable[None]]] = None
+        # Wired by the network layer after startup. Called once per (command,
+        # device) when the command SETTLES — executed, skipped or errored alike —
+        # with executed=False for a command that never ran.
+        self.on_command_complete: Optional[Callable[[Command, str, bool], Awaitable[None]]] = None
 
 
     async def load_config(self, config_path: Path = Path("./devices.json")):
@@ -116,6 +122,13 @@ class RemoteLabManager:
 
         # Stop accepting and executing commands first
         await self._scheduler.shutdown()
+        # Drain the fire-and-forget notification tasks before the loop goes away.
+        # Snapshot first: each task's done-callback removes it from the set.
+        pending = list(self._bg_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         # Then tear down device processes
         await self._supervisor.shutdown()
         # Release navigation resources (ArUco camera capture threads), if any
@@ -126,38 +139,51 @@ class RemoteLabManager:
         await logger.log("MANAGER", "Shutdown complete")
 
 
+    def _spawn(self, coro):
+        """Run a coroutine fire-and-forget, keeping a strong reference to the task."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     async def _on_execute_command(self, command: Command, device_name: str):
         driver = self._drivers.get(device_name)
         if driver is None:
             raise RuntimeError(f"No driver registered for '{device_name}'")
-        try:
-            await driver.execute_command(command)
-        finally:
-            if self.on_command_complete:
-                try:
-                    await self.on_command_complete(command, device_name)
-                except Exception:
-                    pass  # don't mask CancelledError or the driver exception
+        await driver.execute_command(command)
+        # NB: the client is notified from _on_command_settled, not here. The
+        # scheduler settles a command even when it never runs, and awaiting a
+        # notification in a finally block while this coroutine is being cancelled
+        # (interrupt / E-stop) is fragile.
 
-    def _on_command_settled(self, command: Command, device_name: str):
+    def _on_command_settled(self, command: Command, device_name: str, executed: bool):
         """
         Called by the scheduler once per (command, device) when the command leaves
         the queue for good — executed, skipped (cancelled), or errored alike.
 
-        Unblocks any procedure awaiting this command in submit_command_wait().
-        Because settlement fires even for skipped commands, a cancelled command no
-        longer leaves submit_command_wait() hanging forever.
+        Two things happen here:
+          1. Any procedure awaiting this command in submit_command_wait() is
+             unblocked. Because settlement fires even for skipped commands, a
+             cancelled command no longer leaves submit_command_wait() hanging.
+          2. The network layer is notified, so the REMOTE client is unblocked on
+             exactly the same terms. Notifying only on execution used to leave
+             `await cmd` on the client hanging forever whenever a command was
+             cancelled, and leaked the per-command tracking entries with it.
         """
         waiter = self._command_waiters.get(command.command_id)
-        if not waiter:
-            return
-        event, remaining = waiter
-        remaining -= 1
-        if remaining <= 0:
-            self._command_waiters.pop(command.command_id, None)
-            event.set()
-        else:
-            self._command_waiters[command.command_id] = (event, remaining)
+        if waiter:
+            event, remaining = waiter
+            remaining -= 1
+            if remaining <= 0:
+                self._command_waiters.pop(command.command_id, None)
+                event.set()
+            else:
+                self._command_waiters[command.command_id] = (event, remaining)
+
+        # Sync callback (the scheduler calls it from a finally block), so hand the
+        # async notification off to a task rather than awaiting it here.
+        if self.on_command_complete:
+            self._spawn(self.on_command_complete(command, device_name, executed))
 
 
     def _check_access(self, client_id: str, devices: List[str]):
@@ -258,6 +284,26 @@ class RemoteLabManager:
         """Interrupt the command currently executing on every device."""
         self._scheduler.interrupt_all_devices()
 
+    def emergency_stop_all(self):
+        """
+        Publish a physical stop on every actuator channel of every device.
+
+        The last line of defence in stop_all. Cancelling queued commands and
+        interrupting running ones only stops work the scheduler owns; an actuator
+        left latched by a command that already returned (a HOLD setpoint, say)
+        keeps running and nothing above would touch it. This reaches the hardware
+        directly, bypassing the queue — which may itself be paused by a device
+        restart at that very moment.
+        """
+        for device_name, driver in self._drivers.items():
+            try:
+                driver.emergency_stop()
+            except Exception as e:
+                # Never let one unhappy driver stop us from halting the rest.
+                self._spawn(Logger.get().log(
+                    "MANAGER", f"emergency_stop failed for '{device_name}': {e}"
+                ))
+
     async def run_procedure(self, name: str, client_id: str, args: dict) -> str:
         """
         Start a group procedure by name. Returns procedure_id immediately.
@@ -283,18 +329,5 @@ class RemoteLabManager:
         """Expose ProcedureManager so ws_handler can wire its callbacks."""
         return self._procedure_manager
 
-
-async def main():
-    manager = RemoteLabManager()
-    await manager.load_config()
-    await manager.start()
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        await manager.shutdown()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# No __main__ here on purpose: the server is started through network/server.py,
+# which also brings up roscore, the user store and the WebSocket layer.

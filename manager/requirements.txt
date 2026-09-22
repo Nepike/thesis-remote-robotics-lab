@@ -1,32 +1,51 @@
-annotated-doc==0.0.4
-annotated-types==0.7.0
-anyio==4.5.2
-click==8.1.8
-colorama==0.4.6
-contourpy==1.1.1
-cycler==0.12.1
-exceptiongroup==1.3.1
+# RemoteLab manager — runtime dependencies.
+#
+# Install into the manager's virtualenv:
+#     python -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# NOT listed here: rospy / geometry_msgs / msg_yy. Those come from the ROS Noetic
+# installation and the catkin workspace, not from pip — see docs/ros-setup.md.
+# Run the server with the ROS environment sourced.
+
+# --- WebSocket server ---
 fastapi==0.124.4
-fonttools==4.57.0
-h11==0.16.0
-idna==3.15
-importlib_resources==6.4.5
-kiwisolver==1.4.7
-matplotlib==3.7.5
-numpy==1.24.4
-opencv-contrib-python==4.13.0.92
-packaging==26.2
-pillow==10.4.0
+uvicorn==0.33.0
+# uvicorn needs this for the WebSocket protocol; the client library imports it directly
+websockets==13.1
+starlette==0.44.0
 pydantic==2.10.6
 pydantic_core==2.27.2
-pyparsing==3.1.4
+h11==0.16.0
+anyio==4.5.2
+sniffio==1.3.1
+idna==3.15
+click==8.1.8
+colorama==0.4.6
+exceptiongroup==1.3.1
+annotated-types==0.7.0
+# typing.Annotated for the discriminated message union lives here on Python 3.8
+typing_extensions==4.13.2
+
+# --- Serial transport (SerialBasedDriver) ---
 pyserial==3.5
 pyserial-asyncio==0.6
+
+# --- Navigation: UKF / A* / ArUco localization ---
+numpy==1.24.4
+opencv-contrib-python==4.13.0.92
+
+# --- Optional: only for navigation/aruco_test.py --visual ---
+# The server itself never imports matplotlib; drop these if you do not use the
+# ArUco debugging view.
+matplotlib==3.7.5
+contourpy==1.1.1
+cycler==0.12.1
+fonttools==4.57.0
+kiwisolver==1.4.7
+pillow==10.4.0
+pyparsing==3.1.4
 python-dateutil==2.9.0.post0
 six==1.17.0
-sniffio==1.3.1
-starlette==0.44.0
-typing_extensions==4.13.2
-uvicorn==0.33.0
-websockets==13.1
+importlib_resources==6.4.5
 zipp==3.20.2

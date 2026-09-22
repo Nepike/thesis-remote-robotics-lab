@@ -7,6 +7,7 @@ the real system: positions in metres, angles in radians, velocities in m/s and
 rad/s. The grid is in cells; one cell is `cfg.cell_size_m` metres.
 """
 
+import heapq
 import math
 from typing import List, Optional, Set, Tuple
 
@@ -40,6 +41,11 @@ def a_star(
     Heuristic: Manhattan distance (admissible for 4-connectivity -> optimal path).
     `blocked` already includes the inflation buffer around obstacles.
     Returns the list of cells start..goal, or None if no path exists.
+
+    The open set is a binary heap, so picking the next cell is O(log n) instead of
+    the O(n) scan a plain set would need. Improved cells are pushed again rather
+    than decrease-key'd (heapq has no such operation) and stale entries are skipped
+    on pop via `closed` — the standard lazy-deletion variant.
     """
     if start in blocked or goal in blocked:
         return None
@@ -47,15 +53,17 @@ def a_star(
     def h(c: Tuple[int, int]) -> float:
         return abs(c[0] - goal[0]) + abs(c[1] - goal[1])
 
-    open_set = {start}
     came_from: dict = {}
     g = {start: 0.0}
-    f = {start: h(start)}
+    open_heap: List[Tuple[float, Tuple[int, int]]] = [(h(start), start)]
+    closed: Set[Tuple[int, int]] = set()
 
     neighbors = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
-    while open_set:
-        current = min(open_set, key=lambda c: f.get(c, float("inf")))
+    while open_heap:
+        _, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue          # stale duplicate, already expanded via a cheaper path
         if current == goal:
             path = [current]
             while current in came_from:
@@ -63,20 +71,19 @@ def a_star(
                 path.append(current)
             path.reverse()
             return path
+        closed.add(current)
 
-        open_set.remove(current)
         for dx, dy in neighbors:
             nb = (current[0] + dx, current[1] + dy)
             if not (0 <= nb[0] < grid_w and 0 <= nb[1] < grid_h):
                 continue
-            if nb in blocked:
+            if nb in blocked or nb in closed:
                 continue
             tentative_g = g[current] + 1.0
             if tentative_g < g.get(nb, float("inf")):
                 came_from[nb] = current
                 g[nb] = tentative_g
-                f[nb] = tentative_g + h(nb)
-                open_set.add(nb)
+                heapq.heappush(open_heap, (tentative_g + h(nb), nb))
     return None
 
 
@@ -90,9 +97,15 @@ class UKF:
 
     Measurement model is identity (the camera/ArUco gives x, y, theta directly).
     Call update(None) to skip the correction step on a dropped measurement.
+
+    Sigma-point weights: alpha=1, kappa=0 gives lambda=0, so every weight is >= 0
+    and the covariance update can never lose positive-definiteness. (With the
+    previous alpha=0.5 the centre weight came out at Wc[0] = -0.25, which could
+    push P out of PSD and left the Cholesky jitter fallback below papering over it
+    on every step.)
     """
 
-    def __init__(self, x0, P0, Q, R, alpha: float = 0.5, beta: float = 2.0, kappa: float = 0.0):
+    def __init__(self, x0, P0, Q, R, alpha: float = 1.0, beta: float = 2.0, kappa: float = 0.0):
         self.x = np.array(x0, dtype=float)
         self.P = np.array(P0, dtype=float)
         self.Q = np.array(Q, dtype=float)

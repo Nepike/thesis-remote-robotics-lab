@@ -61,12 +61,17 @@ class _PendingCommand:
         self._remaining = num_devices
         self._event = asyncio.Event()
         self._error: Optional[Exception] = None
+        # True if at least one device reported the command as cancelled rather
+        # than completed (it was dropped from the queue before the driver ran it).
+        self.cancelled = False
 
-    def notify_done(self) -> bool:
+    def notify_done(self, cancelled: bool = False) -> bool:
         """
-        Called each time one device sends 'done'.
-        Returns True when ALL devices are done (event is set).
+        Called each time one device settles the command ('done').
+        Returns True when ALL devices have settled (event is set).
         """
+        if cancelled:
+            self.cancelled = True
         self._remaining -= 1
         if self._remaining <= 0:
             self._event.set()
@@ -155,6 +160,9 @@ class Connection:
 
         self._ws = None
         self._reader_task: Optional[asyncio.Task] = None
+        # Strong ref to the in-flight reconnect: asyncio only holds a weak one, and
+        # a collected reconnect task would leave the client permanently offline.
+        self._reconnect_task: Optional[asyncio.Task] = None
         self._connected = False
 
         # Serializes all sends - prevents interleaved frames from concurrent callers.
@@ -201,6 +209,18 @@ class Connection:
     async def disconnect(self):
         """Close the connection gracefully."""
         self._connected = False
+        # Stop a reconnect in progress first, or it would re-open the socket
+        # behind us and leave a live reader task after disconnect() returned.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            # _reconnect clears _ready while it works and only sets it again on
+            # its own way out. Cancelled half-way it never gets there, and every
+            # later _send() would block on _ready forever instead of raising.
+            self._ready.set()
         if self._reader_task:
             self._reader_task.cancel()
             try:
@@ -234,7 +254,7 @@ class Connection:
         except Exception as exc:
             if self._connected:
                 log.warning("RemoteLab: connection lost (%s), reconnecting...", exc)
-                asyncio.create_task(self._reconnect(exc), name="remoteLab-reconnect")
+                self._reconnect_task = asyncio.ensure_future(self._reconnect(exc))
 
     def _dispatch(self, msg: dict):
         """Route one server message to the appropriate handler."""
@@ -250,7 +270,8 @@ class Connection:
             command_id = msg.get("command_id", "")
             pending = self._pending_commands.get(command_id)
             if pending:
-                fully_done = pending.notify_done()
+                # status is "completed" or "cancelled"; older servers omit it.
+                fully_done = pending.notify_done(msg.get("status") == "cancelled")
                 if fully_done:
                     self._pending_commands.pop(command_id, None)
 

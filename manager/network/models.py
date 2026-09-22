@@ -121,15 +121,22 @@ class AckMessage(BaseModel):
 
 class DoneMessage(BaseModel):
     """
-    Command finished executing on a specific device.
+    Command settled on a specific device — it will not be worked on again.
 
     For multi-device commands the client receives one DoneMessage per device.
     The client-side robot.move() unblocks when it has received Done from all
     targeted devices.
+
+    `status` says how it settled:
+        completed — the driver ran it (possibly interrupted part-way)
+        cancelled — it was cancelled before the driver ever saw it
+    A cancelled command is reported too, otherwise `await cmd` on the client
+    would wait for a completion that is never coming.
     """
     type: Literal["done"] = "done"
     command_id: str
     device: str
+    status: Literal["completed", "cancelled"] = "completed"
 
 
 class TelemetryMessage(BaseModel):
@@ -192,12 +199,17 @@ class ErrorMessage(BaseModel):
     Server-side error that the client should surface to the caller.
 
     Codes (string enum, intentionally not a Python Enum to stay wire-stable):
-        UNKNOWN_DEVICE     — device name not registered
-        ACCESS_DENIED      — client does not hold exclusive lock
-        ALREADY_OWNED      — acquire failed, device owned by another client
-        UNKNOWN_PROCEDURE  — procedure name not registered on the server
+        UNKNOWN_DEVICE     — device name not registered          (answers: submit)
+        ACCESS_DENIED      — client does not hold exclusive lock  (answers: submit)
+        ALREADY_OWNED      — acquire failed, owned by another     (answers: acquire)
+        UNKNOWN_PROCEDURE  — procedure name not registered        (answers: run_procedure)
+        SUBSCRIBE_FAILED   — telemetry subscribe rejected         (answers: subscribe_telemetry)
         UNKNOWN_MESSAGE    — unrecognized message type
         INTERNAL           — unexpected server-side exception
+
+    The client matches an error to the request it answers by code, so a code must
+    belong to exactly ONE request type — otherwise an error for one request pops
+    the waiter of an unrelated one.
     """
     type: Literal["error"] = "error"
     code: str
