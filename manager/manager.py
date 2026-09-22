@@ -8,7 +8,7 @@ from BasicClasses import Command, Device
 from CommandScheduler import CommandScheduler
 from DeviceDrivers import AbstractDriver, DriverFactory
 from DeviceSupervisor import DeviceSupervisor
-from HardwareInterfaces import RosInterface, SerialInterface
+from HardwareInterfaces import RosInterface, SerialInterface, TcpInterface
 from Logger import Logger
 from Procedures import AllGoHome, StopAll, SyncTest, ProcedureManager, shutdown_navigation
 
@@ -32,8 +32,9 @@ class RemoteLabManager:
         # Hardware interfaces - shared across all drivers of the same type
         self._ros    = RosInterface()
         self._serial = SerialInterface()
+        self._tcp    = TcpInterface()
 
-        self._driver_factory     = DriverFactory(self._ros, self._serial)
+        self._driver_factory     = DriverFactory(self._ros, self._serial, self._tcp)
         self._supervisor         = DeviceSupervisor()
         self._scheduler          = CommandScheduler(self._on_execute_command)
         self._access_controller  = AccessController()

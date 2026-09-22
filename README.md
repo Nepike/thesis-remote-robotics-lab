@@ -27,10 +27,11 @@ hardware at once.
     .lock()               ├──────────────────────────────┤
     .submit(cmd) ────────▶│  AccessController  (locks)   │
     .subscribe_telemetry  │  CommandScheduler  (queues)  │        ┌── RosInterface ──▶ ROS ──▶ robots
-    .run_procedure ──────▶│  ProcedureManager            │───────▶│
+    .run_procedure ──────▶│  ProcedureManager            │───────▶│── TcpInterface ────▶ ESP32 micro-robots
                           │  DeviceSupervisor  (health)  │        └── SerialInterface ──▶ ESP32 / Arduino
                           ├──────────────────────────────┤
-            telemetry ◀───│  Drivers: Yarp13, SimpleSerial│
+     telemetry ◀──────────│  Drivers: Yarp13, Microbot,  │
+                          │           SimpleSerial       │
                           └──────────────┬───────────────┘
                                          │
                               Navigation │ ArUco + Kalman + A*
@@ -50,7 +51,7 @@ do not run uvicorn with `--workers > 1`.
 | Two clients, one robot | `AccessController` — devices are `exclusive` (must be locked) or `shared` (free-for-all). Locks are released automatically when a client disconnects |
 | Ordering | `CommandScheduler` — one queue per device, priority-ordered, with a worker per device |
 | Long commands | Commands are awaitable handles. A client may fire-and-forget, `await` completion, wait with a timeout, or `interrupt()` what is running now |
-| Dead hardware | `DeviceSupervisor` watches telemetry liveness and marks devices down |
+| Dead hardware | `DeviceSupervisor` watches the transport and adapter processes and restarts a device when one dies, pausing its queue for the duration. Telemetry liveness is checked separately, by `sync_test` |
 | Group manoeuvres | Procedures run *on the server*, acquire the devices they need themselves, and are cancellable |
 
 Three procedures ship with it: `stop_all` (emergency stop for the whole lab), `sync_test`
@@ -79,6 +80,7 @@ Setup, marker ID allocation and printing are documented in
 | `client/example.py` | A runnable tour of every client feature, doubling as documentation |
 | `firmware/yarp13-mega/` | Robot firmware: motor PID, encoders, compass, rangefinders, servos, reflex stop |
 | `firmware/esp32-gateway/` | Wi-Fi gateway between the robot and the server |
+| `firmware/esp32-microbot/` | Micro-robot firmware: the ESP32 *is* the controller — twist, rangefinders, OLED network picker |
 | `firmware/custom-protocol/` | A binary serial protocol with typed arguments and CRC, plus master/slave examples |
 | `docs/` | The thesis, and host setup instructions |
 
@@ -133,8 +135,26 @@ async with RemoteLab("lab.host:8000", "user", "password") as lab:
 
 Devices are data, not code, up to the point where the protocol differs. A new robot of an
 existing type is a row in `devices.json`. A genuinely new type means a driver subclassing
-`RosBasedDriver` or `SerialBasedDriver`, registered in `DriverFactory` under a string key —
-after which the client's command catalogue picks it up without touching client logic.
+`RosBasedDriver`, `TcpBasedDriver` or `SerialBasedDriver`, registered in `DriverFactory`
+under a string key. Declare the driver's `COMMANDS` tuple and the server serves that
+catalogue to clients over `get_devices`, so nothing client-side has to learn the new type.
+
+### Two shapes of device
+
+The fleet is heterogeneous on purpose, and the two robot types sit on opposite sides of the
+project's central trade-off — how much intelligence belongs on the robot.
+
+| | yarp-13 | micro-robot |
+|---|---|---|
+| On-board | Arduino Mega + ESP32 bridging TCP↔UART | one ESP32, controller and radio in the same chip |
+| Server side | socat → rosserial → ROS topics | a plain socket, no helper processes |
+| Protocol | ROS messages (`cmd_vel`, `yy_command`) | newline ASCII (`TWIST v w`) |
+| Restarts | `DeviceSupervisor` restarts dead processes | `TcpInterface` reconnects the socket itself |
+| Link loss | firmware watchdog, behind a physical switch | firmware deadman, unconditional |
+
+The micro-robot needs no `ros_namespace` and no `baud_rate` — only the address it listens on.
+To let it join `all_go_home`, give it an ArUco marker and an entry under `robots` in the
+navigation config; the procedure finds it by duck-typing `set_velocity`, not by driver name.
 
 ## Notes
 

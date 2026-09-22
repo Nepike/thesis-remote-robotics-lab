@@ -355,11 +355,21 @@ class SyncTest(AbstractProcedure):
         try:
             await logger.log("PROC", f"sync_test: running on {acquired}")
 
-            # 1. Beep — the whole group at once.
-            await manager.submit_command_wait(
-                client_id, acquired, "beep", self._PRIORITY,
-                {"duration": self._BEEP_S},
-            )
+            # 1. Beep — but only on robots that actually have a beeper. The fleet
+            #    is heterogeneous by design: the micro-robots have wheels and
+            #    rangefinders and nothing to make noise with, and sending them a
+            #    command their driver does not implement would log one error per
+            #    robot per run for no reason.
+            beepers = []
+            for name in acquired:
+                drv = manager.get_driver(name)
+                if drv is not None and drv.supports("beep"):
+                    beepers.append(name)
+            if beepers:
+                await manager.submit_command_wait(
+                    client_id, beepers, "beep", self._PRIORITY,
+                    {"duration": self._BEEP_S},
+                )
 
             # 2. Spin LEFT in place.
             await manager.submit_command_wait(

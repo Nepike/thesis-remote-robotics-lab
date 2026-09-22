@@ -94,6 +94,18 @@ DRIVER_COMMANDS = {
         Cmd("set_klpf", "ФНЧ скорости привода: k (0..1)", dict(k=1.0)),
     ],
 
+    # Трёхколёсный микро-робот (MicrobotDriver + firmware/esp32-microbot).
+    # ESP32 здесь сам себе контроллер: ни Arduino, ни rosserial под ним нет.
+    "microbot": [
+        Cmd("move", "Движение: speed_lin (м/с, +вперёд), speed_ang (рад/с, +влево), duration (с)",
+            dict(speed_lin=0.15, speed_ang=0.0, duration=2.0)),
+        Cmd("stop", "Немедленная остановка колёс", {}),
+        Cmd("set_pid", "Коэффициенты ПИД: kp, ki, kd (контур пока разомкнут — нет энкодеров)",
+            dict(kp=0.8, ki=0.0, kd=0.0)),
+        Cmd("arm",    "Включить силовую часть (TB6612 STBY)", {}),
+        Cmd("disarm", "Обесточить моторы, не разрывая связь", {}),
+    ],
+
     # Пример минимального последовательного устройства (SimpleSerialDevice).
     # Протокол — строки "<ИМЯ> [аргументы]\\n"; аргументы идут как значения kwargs.
     "simple_serial": [
@@ -109,6 +121,8 @@ DRIVER_COMMANDS = {
 DRIVER_TELEMETRY = {
     "yarp13": "enc_left/right, speed_left/right, compass, pitch, roll, acc_voltage, "
               "rf_* (дальномеры), pwm_left/right, bumpers, status, cmd_count",
+    "microbot": "uptime_ms, rf_left/center/right (см, -1 = вне 10..80 см), vbat, "
+                "speed_lin/ang (уставка), pwm_left/right, armed, kp/ki/kd",
     "simple_serial": "uptime, value, status",
     # <- и сюда строку про телеметрию нового драйвера.
 }
@@ -131,16 +145,36 @@ def print_command_catalog(devices: list):
     печатает список доступных команд и поля телеметрии. Именно здесь видно, чем
     отличается yarp-13 от других типов.
     """
+    # Имена команд, объявленные самим сервером (DeviceInfo.commands) — источник
+    # истины. Словарь ниже добавляет к ним человеческие описания и примеры
+    # аргументов, которых по проводу не приходит.
+    server_catalog = {}
+    for d in devices:
+        if d.get("commands"):
+            server_catalog.setdefault(d["driver"], set()).update(d["commands"])
+
     driver_types = sorted({d["driver"] for d in devices})
     print("Что можно отправлять (каталог команд по типам устройств):")
     for dt in driver_types:
         print(f"\n  ── Драйвер «{dt}» " + "─" * (40 - len(dt)))
         commands = DRIVER_COMMANDS.get(dt)
         if not commands:
-            print("     (команды для этого типа не описаны в примере — дополните DRIVER_COMMANDS)")
+            # Описаний нет, но сервер мог прислать сами имена — лучше показать
+            # хотя бы их, чем разводить руками.
+            known = sorted(server_catalog.get(dt, ()))
+            if known:
+                print("     (описаний нет, список команд от сервера:)")
+                print("     " + ", ".join(known))
+            else:
+                print("     (команды для этого типа не описаны в примере — дополните DRIVER_COMMANDS)")
             continue
         for c in commands:
             print(f"     {c.name:<16} {c.desc}")
+        # Сервер знает команду, а пример про неё молчит — значит каталог в этом
+        # файле отстал от драйвера.
+        missing = sorted(server_catalog.get(dt, set()) - {c.name for c in commands})
+        if missing:
+            print(f"     (сервер знает ещё: {', '.join(missing)} — допишите в DRIVER_COMMANDS)")
         tele = DRIVER_TELEMETRY.get(dt, "— не описана —")
         print(f"     · телеметрия: {tele}")
     print()
@@ -209,18 +243,27 @@ async def demo_group_direct(lab: RemoteLab, devices: list):
     Групповая команда НАПРЯМУЮ с клиента: одна submit на список устройств.
     Хэндл завершится, когда КАЖДОЕ устройство отчитается 'done'.
 
-    Берём только shared-устройства: для exclusive нужен предварительный lock
-    каждого (см. demo_single_device).
+    Групповая команда проходит, только если у клиента есть доступ КО ВСЕМ
+    перечисленным устройствам. Поэтому захватываем их все сразу: AsyncExitStack
+    держит несколько lock() одновременно и гарантированно отпускает каждый на
+    выходе — в том числе если захват пятого устройства упадёт после четырёх
+    удачных. Для shared-устройств lock() — no-op, так что шаблон универсален.
     """
-    shared = [d["name"] for d in devices if d["shared"]]
-    if not shared:
-        print("[Группа] нет shared-устройств для прямой групповой команды.\n")
+    names = [d["name"] for d in devices]
+    if not names:
+        print("[Группа] нет устройств для групповой команды.\n")
         return
 
-    print(f"[Группа] синхронный beep на {shared}...")
-    cmd = await lab.submit(shared, "beep", priority=5, duration=0.7)
-    await cmd
-    print("  готово.\n")
+    print(f"[Группа] синхронный beep на {names}...")
+    try:
+        async with AsyncExitStack() as stack:
+            for name in names:
+                await stack.enter_async_context(lab.device(name).lock())
+            cmd = await lab.submit(names, "beep", priority=5, duration=0.7)
+            await cmd
+        print("  готово.\n")
+    except AcquireError as e:
+        print(f"  пропускаем: устройство занято другим клиентом ({e})\n")
 
 
 async def demo_procedures(lab: RemoteLab):
@@ -257,11 +300,12 @@ async def demo_emergency_stop(lab: RemoteLab, device_names: list):
     robot = lab.device(name)
     print(f"[Авария] демонстрация interrupt+stop на '{name}'...")
 
-    # запускаем длинное движение и тут же прерываем его
-    await robot.submit("move", speed_lin=0.0, speed_ang=1.0, duration=10.0)
-    await asyncio.sleep(0.5)
-    await robot.interrupt()                       # прервать текущее
-    await robot.submit("stop", priority=999)      # и сразу стоп
+    async with robot.lock():
+        # запускаем длинное движение и тут же прерываем его
+        await robot.submit("move", speed_lin=0.0, speed_ang=1.0, duration=10.0)
+        await asyncio.sleep(0.5)
+        await robot.interrupt()                       # прервать текущее
+        await robot.submit("stop", priority=999)      # и сразу стоп
     print("  движение прервано и остановлено.\n")
 
 

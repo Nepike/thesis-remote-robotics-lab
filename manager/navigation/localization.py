@@ -22,6 +22,7 @@ Providers:
 
 import math
 import random
+import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -197,6 +198,14 @@ class ArucoLocalizationProvider(LocalizationProvider):
 # it must return the SAME instance rather than re-opening the cameras each time.
 _aruco_singleton: Optional[ArucoLocalizationProvider] = None
 
+# Guards the singleton. A plain `if None: build` is only safe while the builder
+# runs on the event loop, and it no longer does: constructing the ArUco provider
+# opens cameras, which blocks, so the caller hands it to a thread executor. Two
+# AllGoHome runs starting together would then both see None, both open the
+# cameras, and the loser's capture threads would be orphaned — holding the
+# devices open with nobody to stop them.
+_aruco_lock = threading.Lock()
+
 
 def build_localization_provider(cfg) -> LocalizationProvider:
     """
@@ -205,12 +214,15 @@ def build_localization_provider(cfg) -> LocalizationProvider:
     The simulated provider is stateful per run and created fresh each time. The
     ArUco provider is a process-wide singleton (cameras stay open between runs);
     camera/calibration changes in nav_config.json take effect on server restart.
+
+    Safe to call from a worker thread — see _aruco_lock.
     """
     if cfg.provider == "aruco":
         global _aruco_singleton
-        if _aruco_singleton is None:
-            _aruco_singleton = ArucoLocalizationProvider(cfg)
-        return _aruco_singleton
+        with _aruco_lock:
+            if _aruco_singleton is None:
+                _aruco_singleton = ArucoLocalizationProvider(cfg)
+            return _aruco_singleton
     return SimulatedLocalizationProvider(cfg)
 
 
@@ -223,6 +235,7 @@ def shutdown_localization() -> None:
     on a normal server stop.
     """
     global _aruco_singleton
-    if _aruco_singleton is not None:
-        _aruco_singleton.close()
-        _aruco_singleton = None
+    with _aruco_lock:
+        if _aruco_singleton is not None:
+            _aruco_singleton.close()
+            _aruco_singleton = None

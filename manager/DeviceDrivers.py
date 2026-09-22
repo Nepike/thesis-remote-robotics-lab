@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
 import asyncio
 from pathlib import Path
 import os
@@ -9,9 +9,9 @@ import geometry_msgs.msg
 import msg_yy.msg
 
 from BasicClasses import Device, Command
-from HardwareInterfaces import RosInterface, SerialInterface
+from HardwareInterfaces import RosInterface, SerialInterface, TcpInterface
 from Logger import Logger
-from TelemetryTypes import Yarp13Telemetry, SimpleSerialTelemetry
+from TelemetryTypes import Yarp13Telemetry, SimpleSerialTelemetry, MicrobotTelemetry
 
 
 class AbstractDriver(ABC):
@@ -20,6 +20,13 @@ class AbstractDriver(ABC):
 
     Each driver must implement command execution logic and interface-required processes (transports, adapters) start logic
     """
+
+    # Command names this driver accepts, in the order they are worth showing to
+    # a human. Served to clients through get_devices(), so a new device type no
+    # longer means editing the client to teach it what the type can do — and
+    # procedures that run across a HETEROGENEOUS fleet can ask instead of
+    # assuming every robot has, say, a beeper.
+    COMMANDS: Tuple[str, ...] = ()
 
     def __init__(self, device: Device):
         self._device: Device = device
@@ -117,6 +124,16 @@ class AbstractDriver(ABC):
         Default is a no-op so a driver with no actuators needs no implementation.
         """
         pass
+
+    def supports(self, command_name: str) -> bool:
+        """
+        True if this driver implements the named command.
+
+        A driver that leaves COMMANDS empty has not declared a catalogue, so we
+        answer True and let execute_command() be the judge — that keeps the
+        check backwards-compatible with any driver written before COMMANDS existed.
+        """
+        return (not self.COMMANDS) or (command_name in self.COMMANDS)
 
     def get_telemetry(self) -> Optional[Any]:
         """Return the latest received telemetry snapshot, or None if nothing has arrived yet."""
@@ -270,6 +287,44 @@ class SerialBasedDriver(AbstractDriver):
         pass
 
 
+class TcpBasedDriver(AbstractDriver):
+    """
+    Base class for devices that speak a line protocol over TCP directly.
+
+    Use this when the network endpoint IS the robot's controller (the ESP32 runs
+    the control loop itself) rather than a transparent bridge to a second MCU.
+    Such a device needs neither socat nor rosserial, so both process hooks return
+    empty tuples.
+
+    That has a consequence worth stating: DeviceSupervisor restarts a device when
+    one of its PROCESSES dies, and here there are none — `transports_alive()` and
+    `adapters_alive()` treat an empty tuple as alive, so the supervisor will never
+    restart this device. It doesn't need to: TcpInterface reconnects the socket on
+    its own, and `_online` flips back the moment telemetry resumes.
+    """
+
+    def __init__(self, device: Device, tcp: TcpInterface):
+        super().__init__(device)
+        self._tcp: TcpInterface = tcp
+
+    async def start_transports(self) -> Tuple[asyncio.subprocess.Process, ...]:
+        """Nothing to start: the connection is a plain socket, opened in setup_telemetry."""
+        return ()
+
+    async def start_adapters(self) -> Tuple[asyncio.subprocess.Process, ...]:
+        """Nothing to start: the device speaks its own protocol, no adapter in between."""
+        return ()
+
+    @abstractmethod
+    async def execute_command(self, command: Command):
+        """
+        Executes a command via TcpInterface.
+
+        You must override this method for every device type.
+        """
+        pass
+
+
 # ---------------------------- BASIC INTERFACE-BASED DRIVERS GO ABOVE ----------------------------
 
 # ---------------------------- CUSTOM DRIVERS GO HERE ----------------------------
@@ -290,6 +345,15 @@ class Yarp13Driver(RosBasedDriver):
     - beep
     - ...
     """
+
+    COMMANDS: Tuple[str, ...] = (
+        "move", "stop", "dctl", "pidctl",
+        "beep", "beep_on", "beep_off",
+        "gun_on", "gun_off",
+        "set_servo", "set_enc", "set_refl_dist", "set_motors_ratio",
+        "set_pid", "set_pid_left", "set_pid_right",
+        "compass_calibr", "set_calibr_speed", "set_klpf",
+    )
 
     # Command codes for msg_yy::cmd (from y13cmd.h)
     _CMD: Dict[str, int] = {
@@ -564,11 +628,18 @@ class Yarp13Driver(RosBasedDriver):
             # (e.g. dctl w_l=w_r=0 with a duration). Used by the joystick teleop so
             # consecutive setpoints don't fight a stop tail.
             #
-            # TODO: подумать про безопасность HOLD. Сейчас единственный backstop, когда
-            # клиент перестал слать но остался на связи (или умер), — прошивочный watchdog
-            # (Wait_cmd_time ~2 c, к тому же под тумблером SW_CONNECT). Прежде чем полагаться
-            # на HOLD в проде: укоротить Wait_cmd_time / развязать от тумблера, и/или слать
-            # стоп на дисконнект клиента со стороны сервера.
+            # Безопасность HOLD. Явная остановка теперь есть: stop_all зовёт
+            # emergency_stop(), который шлёт нулевой dctl/pidctl напрямую, минуя
+            # очередь, — раньше сорванный HOLD не останавливало вообще ничто на
+            # сервере (отменять и прерывать было нечего: команда уже завершилась).
+            #
+            # Чего ещё НЕТ: автоматического стопа, когда клиент замолчал, но связь
+            # цела, — его некому инициировать, для этого нужен серверный дедман
+            # (control plane, фаза 1). Плюс стоп на дисконнект клиента.
+            # Последний рубеж, если умрёт сам сервер, — прошивочный watchdog:
+            # Wait_cmd_time ~2 c, и он под тумблером SW_CONNECT (при разомкнутом
+            # входе INPUT_PULLUP читается как «выключено», то есть отказ проводки
+            # тихо снимает защиту). Прошивка в рамках работы не менялась.
             yy = Cmd()
             yy.command = self._CMD[command.name]
             yy.arg     = [float(a.get("w_l", 0.0)), float(a.get("w_r", 0.0))]
@@ -663,6 +734,10 @@ class SimpleSerialDevice(SerialBasedDriver):
     Example commands:  "ON\n",  "OFF\n",  "SET_THRESHOLD 50\n"
     """
 
+    # Left empty on purpose: this driver forwards whatever name it is given
+    # straight to the device, so there is no fixed catalogue to declare.
+    COMMANDS: Tuple[str, ...] = ()
+
     async def setup_telemetry(self):
         await self._serial.open(self._transport_path, self._device.baud_rate)
         self._serial.subscribe_async(self._transport_path, self._on_line)
@@ -692,6 +767,215 @@ class SimpleSerialDevice(SerialBasedDriver):
         await self._serial.write(self._transport_path, (line + "\n").encode())
 
 
+class MicrobotDriver(TcpBasedDriver):
+    """
+    Driver for the three-wheeled micro-robot (firmware/esp32-microbot).
+
+    Unlike yarp-13, there is no Arduino and no rosserial: the ESP32 is the whole
+    robot. We open a socket to it and exchange newline-terminated ASCII.
+
+    Commands:
+        move     speed_lin [m/s], speed_ang [rad/s], duration [s]
+        stop
+        set_pid  kp, ki, kd
+        arm / disarm   — enable / disable the power stage
+
+    The setpoint is STREAMED for the duration of a move, exactly as for yarp-13
+    and for the same reason: a dropped frame is corrected ~100 ms later instead
+    of leaving the robot with a stale command. Here it is also what keeps the
+    firmware deadman fed — the ESP32 zeroes its setpoint after CMD_TIMEOUT_MS
+    without a TWIST, so a server that dies mid-move stops the robot rather than
+    launching it across the room. That is the guarantee yarp-13 never had.
+    """
+
+    COMMANDS: Tuple[str, ...] = ("move", "stop", "set_pid", "arm", "disarm")
+
+    _STREAM_HZ:   float = 10.0   # setpoint streaming rate, Hz
+    _ONESHOT_S:   float = 0.3    # how long to repeat a one-shot command
+    _STOP_TAIL_S: float = 0.6    # how long to keep streaming stop after motion ends
+    _DEADMAN_S:   float = 0.5    # set_velocity deadman (mirrors the firmware timeout)
+
+    # The robot has exactly one actuator group, so unlike Yarp13Driver there is
+    # no channel map to maintain — every tail belongs to the drive.
+    _DRIVE:  str = "drive"
+    _ESTOP:  str = "__estop__"   # reserved slot: no command may cancel an E-stop
+
+    def __init__(self, device: Device, tcp: TcpInterface):
+        super().__init__(device, tcp)
+        self._tails: Dict[str, asyncio.Task] = {}
+        # Strong refs for the sync fire-and-forget paths (set_velocity,
+        # emergency_stop). asyncio only keeps a weak one.
+        self._bg_tasks: Set[asyncio.Task] = set()
+
+    # --- plumbing ------------------------------------------------------------
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    async def _send(self, line: str):
+        await self._tcp.write(self._device.name, (line + "\n").encode())
+
+    async def _send_quiet(self, line: str):
+        """Send, swallowing a lost connection. For background tails and E-stop."""
+        try:
+            await self._send(line)
+        except (ConnectionError, RuntimeError):
+            pass
+
+    async def _stream(self, line: str, duration: float):
+        """Send `line` at _STREAM_HZ for `duration` seconds (at least once)."""
+        period = 1.0 / self._STREAM_HZ
+        n = max(1, int(round(duration / period)))
+        for _ in range(n):
+            await self._send(line)
+            await asyncio.sleep(period)
+
+    def _cancel_tail(self, channel: str):
+        task = self._tails.pop(channel, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _start_stop_tail(self):
+        """
+        Keep streaming STOP in the BACKGROUND after a move ends, so the halt
+        survives cancellation of the owning command coroutine (interrupt/E-stop).
+        """
+        self._cancel_tail(self._DRIVE)
+        self._tails[self._DRIVE] = asyncio.ensure_future(
+            self._stream_quiet("STOP", self._STOP_TAIL_S)
+        )
+
+    async def _stream_quiet(self, line: str, duration: float):
+        period = 1.0 / self._STREAM_HZ
+        for _ in range(max(1, int(round(duration / period)))):
+            await self._send_quiet(line)
+            await asyncio.sleep(period)
+
+    # --- direct control, for server-side procedures ---------------------------
+
+    def set_velocity(self, v: float, omega: float):
+        """
+        Push ONE twist setpoint immediately, for procedures that run their own
+        control loop (AllGoHome). Duck-typed: Procedures looks for this method by
+        name, so implementing it is what makes the micro-robot a first-class
+        participant in group navigation alongside yarp-13.
+
+        Synchronous by contract (the procedure loop calls it without awaiting),
+        so the write is fired off as a task. Each call re-arms a deadman: if
+        setpoints stop arriving the robot is stopped from here too, not only by
+        the firmware timeout.
+        """
+        self._cancel_tail(self._DRIVE)
+        self._spawn(self._send_quiet(f"TWIST {float(v):.4f} {float(omega):.4f}"))
+        self._tails[self._DRIVE] = asyncio.ensure_future(self._deadman())
+
+    async def _deadman(self):
+        try:
+            await asyncio.sleep(self._DEADMAN_S)
+        except asyncio.CancelledError:
+            return
+        await self._stream_quiet("STOP", self._STOP_TAIL_S)
+
+    def emergency_stop(self) -> None:
+        """
+        Halt the drive right now and keep saying so. See AbstractDriver.emergency_stop.
+
+        Also disarms the power stage: unlike the yarp-13 path, this robot has a
+        firmware-level enable, so an E-stop can actually cut the motors instead
+        of only commanding zero speed.
+        """
+        for channel in list(self._tails):
+            self._cancel_tail(channel)
+        self._spawn(self._send_quiet("STOP"))
+        self._spawn(self._send_quiet("ARM 0"))
+        self._tails[self._ESTOP] = asyncio.ensure_future(
+            self._stream_quiet("STOP", self._STOP_TAIL_S)
+        )
+
+    # --- lifecycle -----------------------------------------------------------
+
+    async def setup_telemetry(self):
+        await self._tcp.open(self._device.name, self._device.ip, self._device.port, self._on_line)
+
+    async def teardown_telemetry(self):
+        await super().teardown_telemetry()
+        for channel in list(self._tails):
+            self._cancel_tail(channel)
+        await self._tcp.close(self._device.name)
+
+    async def _on_line(self, line: bytes):
+        text = line.decode(errors="ignore").strip()
+        if not text or "=" not in text:
+            return  # PONG, boot banners, anything that isn't a telemetry frame
+
+        try:
+            kv = dict(part.split("=", 1) for part in text.split(",") if "=" in part)
+            telemetry = MicrobotTelemetry(
+                uptime_ms=int(kv["t"]),
+                rf_left=int(kv["rf_l"]),
+                rf_center=int(kv["rf_c"]),
+                rf_right=int(kv["rf_r"]),
+                vbat=float(kv["vbat"]),
+                speed_lin=float(kv["v"]),
+                speed_ang=float(kv["w"]),
+                pwm_left=int(kv["pwm_l"]),
+                pwm_right=int(kv["pwm_r"]),
+                armed=kv["armed"] == "1",
+                kp=float(kv["kp"]),
+                ki=float(kv["ki"]),
+                kd=float(kv["kd"]),
+            )
+        except (KeyError, ValueError):
+            return  # malformed frame — skip it, the next one is 100 ms away
+
+        self._latest_telemetry = telemetry
+        await self._notify_listeners(telemetry)
+
+    # --- commands ------------------------------------------------------------
+
+    async def execute_command(self, command: Command):
+        a = command.args or {}
+
+        if command.name == "move":
+            # Stream the twist for `duration`, then hand over to a background
+            # stop tail (which outlives cancellation of this coroutine).
+            line = (
+                f"TWIST {float(a.get('speed_lin', 0.0)):.4f} "
+                f"{float(a.get('speed_ang', 0.0)):.4f}"
+            )
+            self._cancel_tail(self._DRIVE)
+            try:
+                await self._stream(line, float(a.get("duration", 0.0)))
+            finally:
+                self._start_stop_tail()
+
+        elif command.name == "stop":
+            self._cancel_tail(self._DRIVE)
+            await self._stream("STOP", self._STOP_TAIL_S)
+
+        elif command.name == "set_pid":
+            # Gains are accepted and stored by the firmware today, but the loop
+            # there is still open — there are no encoders to close it with. The
+            # values come back in telemetry, so a client can verify they landed.
+            await self._stream(
+                f"PID {float(a.get('kp', 0.8)):.4f} "
+                f"{float(a.get('ki', 0.0)):.4f} "
+                f"{float(a.get('kd', 0.0)):.4f}",
+                self._ONESHOT_S,
+            )
+
+        elif command.name in ("arm", "disarm"):
+            if command.name == "disarm":
+                self._cancel_tail(self._DRIVE)
+            await self._stream(f"ARM {1 if command.name == 'arm' else 0}", self._ONESHOT_S)
+
+        else:
+            raise ValueError(f"Unknown command '{command.name}' for MicrobotDriver")
+
+
 # ---------------------------- CUSTOM DRIVERS GO ABOVE ----------------------------
 
 
@@ -699,13 +983,16 @@ class DriverFactory:
     """
     Factory for creating drivers.
     """
-    def __init__(self, ros: RosInterface, serial: SerialInterface):
+    def __init__(self, ros: RosInterface, serial: SerialInterface, tcp: TcpInterface):
         self._ros: RosInterface = ros
         self._serial: SerialInterface = serial
+        self._tcp: TcpInterface = tcp
 
     def create_driver(self, device: Device) -> AbstractDriver:
         if device.driver == "yarp13":
             return Yarp13Driver(device, self._ros)
+        elif device.driver == "microbot":
+            return MicrobotDriver(device, self._tcp)
         elif device.driver == "simple_serial":
             return SimpleSerialDevice(device, self._serial)
         else:

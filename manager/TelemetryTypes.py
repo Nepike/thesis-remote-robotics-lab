@@ -44,6 +44,43 @@ class Yarp13Telemetry:
 
 
 @dataclass
+class MicrobotTelemetry:
+    """
+    Telemetry for the three-wheeled micro-robot (firmware/esp32-microbot).
+
+    The ESP32 sends one newline-terminated line per snapshot:
+        t=<ms>,rf_l=<cm>,rf_c=<cm>,rf_r=<cm>,vbat=<V>,v=<m/s>,w=<rad/s>,
+        pwm_l=<int>,pwm_r=<int>,armed=<0|1>,kp=<f>,ki=<f>,kd=<f>
+    """
+    uptime_ms: int          # milliseconds since the ESP32 booted
+
+    # Sharp GP2Y0A21 rangefinders, centimetres. -1 means "outside 10..80 cm",
+    # which the sensor genuinely cannot resolve: below ~10 cm its curve folds
+    # back and a very close obstacle reads like a distant one. Treat -1 as
+    # "unknown", never as "clear".
+    rf_left: int
+    rf_center: int
+    rf_right: int
+
+    vbat: float             # battery voltage through the on-board divider, V
+
+    # Setpoint the firmware is currently acting on (not a measurement — there
+    # are no encoders yet, see the PID section of the firmware).
+    speed_lin: float        # m/s
+    speed_ang: float        # rad/s
+
+    pwm_left: int           # actually applied duty, -255..255
+    pwm_right: int
+    armed: bool             # power stage enabled (TB6612 STBY / local kill switch)
+
+    # PID gains currently loaded in the firmware, echoed back so a client can
+    # confirm a set_pid actually landed.
+    kp: float
+    ki: float
+    kd: float
+
+
+@dataclass
 class SimpleSerialTelemetry:
     """
     Telemetry for a minimal serial device.

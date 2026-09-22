@@ -167,6 +167,11 @@ class DeviceInfo(BaseModel):
     name: str
     driver: str
     shared: bool
+    # Command names the device's driver accepts. Empty means the driver did not
+    # declare a catalogue (it forwards any name to the hardware), NOT that the
+    # device accepts nothing. Lets a client discover what a device type can do
+    # instead of shipping a hard-coded table per driver.
+    commands: List[str] = Field(default_factory=list)
 
 
 class DevicesMessage(BaseModel):

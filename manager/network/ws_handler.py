@@ -291,10 +291,15 @@ async def _handle_unsubscribe(session: ClientSession, msg: UnsubscribeTelemetryM
 
 
 async def _handle_get_devices(session: ClientSession, _msg: GetDevicesMessage) -> None:
-    infos = [
-        DeviceInfo(name=d.name, driver=d.driver, shared=d.shared)
-        for d in _manager.get_devices()
-    ]
+    infos = []
+    for d in _manager.get_devices():
+        driver = _manager.get_driver(d.name)
+        infos.append(DeviceInfo(
+            name=d.name,
+            driver=d.driver,
+            shared=d.shared,
+            commands=list(driver.COMMANDS) if driver else [],
+        ))
     await session.send(DevicesMessage(data=infos))
 
 

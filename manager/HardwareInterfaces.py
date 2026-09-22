@@ -1,10 +1,13 @@
 import asyncio
-from typing import Dict, Type, Callable, Awaitable
+import socket
+from typing import Dict, Optional, Type, Callable, Awaitable
 from threading import Lock
 from pathlib import Path
 
 import rospy
 import serial_asyncio
+
+from Logger import Logger
 
 
 class RosInterface:
@@ -191,3 +194,160 @@ class SerialInterface:
                 await callback(line)
         except asyncio.CancelledError:
             pass
+
+
+class TcpInterface:
+    """
+    Manages persistent line-oriented TCP connections to network-native devices.
+
+    For a device whose controller IS the network endpoint (an ESP32 that runs the
+    robot itself, rather than bridging to an Arduino), there is nothing to gain
+    from the socat path that RosInterface / SerialInterface use: turning a TCP
+    stream into a pty only to have asyncio read it back as a serial port is a
+    round trip through the kernel for no benefit, plus one more process to
+    supervise. Here we just open the socket.
+
+    Reconnection is the interface's own job. DeviceSupervisor watches PROCESSES,
+    and a driver built on this one has none — so instead of dying and being
+    restarted from outside, each link runs a supervised loop that reconnects on
+    its own. A device that is switched off simply has a link that keeps retrying;
+    writes to it raise ConnectionError until it comes back.
+
+    Each link is identified by an arbitrary key (drivers pass the device name).
+    """
+
+    # How long to wait for a TCP handshake before giving up and retrying.
+    CONNECT_TIMEOUT: float = 5.0
+    # Pause between reconnect attempts. Short enough that a rebooting robot is
+    # back in the fleet quickly, long enough not to spin on a powered-off one.
+    RECONNECT_DELAY: float = 2.0
+
+    class _Link:
+        def __init__(self, host: str, port: int, callback: Callable[[bytes], Awaitable[None]]):
+            self.host = host
+            self.port = port
+            self.callback = callback
+            self.writer: Optional[asyncio.StreamWriter] = None
+            self.task: Optional[asyncio.Task] = None
+
+    def __init__(self):
+        self._links: Dict[str, TcpInterface._Link] = {}
+
+    async def open(self, key: str, host: str, port: int, callback: Callable[[bytes], Awaitable[None]]):
+        """
+        Start (and keep) a connection to host:port, calling `callback` for every
+        received line. Returns immediately — the first connection happens in the
+        background, so a device that is currently off does not block startup.
+        """
+        if key in self._links:
+            return
+        link = TcpInterface._Link(host, port, callback)
+        self._links[key] = link
+        link.task = asyncio.create_task(self._link_loop(key, link), name=f"tcp-link-{key}")
+
+    async def close(self, key: str):
+        """Stop the link loop and drop the connection. Safe to call twice."""
+        link = self._links.pop(key, None)
+        if link is None:
+            return
+
+        if link.task:
+            link.task.cancel()
+            try:
+                await link.task
+            except asyncio.CancelledError:
+                pass
+        await self._close_writer(link.writer)
+        link.writer = None
+
+    def is_connected(self, key: str) -> bool:
+        link = self._links.get(key)
+        return bool(link and link.writer is not None and not link.writer.is_closing())
+
+    async def write(self, key: str, data: bytes):
+        """
+        Send bytes to the device. The caller owns framing (i.e. adds the newline).
+
+        Raises ConnectionError while the device is unreachable. That is deliberate:
+        the command worker logs the failure and the client is told the command
+        settled, instead of a move silently "succeeding" against a robot that is
+        switched off.
+        """
+        link = self._links.get(key)
+        if link is None:
+            raise RuntimeError(f"TCP link not open: {key}")
+
+        writer = link.writer
+        if writer is None or writer.is_closing():
+            raise ConnectionError(f"Device '{key}' ({link.host}:{link.port}) is not connected")
+
+        try:
+            writer.write(data)
+            await writer.drain()
+        except OSError as e:
+            # The link loop will notice and reconnect; report it as a lost
+            # connection rather than leaking a raw socket error upwards.
+            raise ConnectionError(f"Write to '{key}' failed: {e}") from e
+
+    @staticmethod
+    async def _close_writer(writer: Optional[asyncio.StreamWriter]):
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except OSError:
+            pass  # already gone — nothing to clean up
+
+    async def _link_loop(self, key: str, link: "TcpInterface._Link"):
+        """Connect, pump lines until the peer goes away, wait, repeat."""
+        logger = Logger.get()
+        announced_failure = False
+
+        while True:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(link.host, link.port),
+                    timeout=self.CONNECT_TIMEOUT,
+                )
+            except (OSError, asyncio.TimeoutError) as e:
+                # Log the first failure only: a robot that is off would otherwise
+                # print a line every RECONNECT_DELAY seconds, forever.
+                if not announced_failure:
+                    announced_failure = True
+                    await logger.log("TCP", f"'{key}' unreachable ({link.host}:{link.port}): {e}")
+                await asyncio.sleep(self.RECONNECT_DELAY)
+                continue
+
+            announced_failure = False
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                try:
+                    # Same reasoning as setNoDelay() on the ESP32 side: for
+                    # real-time control, latency beats channel efficiency.
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+
+            link.writer = writer
+            await logger.log("TCP", f"'{key}' connected to {link.host}:{link.port}")
+
+            try:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break  # EOF — the device closed the connection
+                    try:
+                        await link.callback(line)
+                    except Exception as e:
+                        # A malformed telemetry line must not tear down the
+                        # transport. Log and keep the link.
+                        await logger.log("TCP", f"'{key}' telemetry callback failed: {e}")
+            except OSError:
+                pass
+            finally:
+                link.writer = None
+                await self._close_writer(writer)
+
+            await logger.log("TCP", f"'{key}' disconnected, reconnecting")
+            await asyncio.sleep(self.RECONNECT_DELAY)

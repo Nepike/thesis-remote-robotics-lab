@@ -57,7 +57,19 @@ _DEVICES_TEMPLATE = [
         "baud_rate": None,
         "shared": False,
         "active": False,
-    }
+    },
+    {
+        # Three-wheeled micro-robot: the ESP32 is the controller, so it needs
+        # neither a ros_namespace nor a baud_rate — just the address it listens on.
+        "name": "example-microbot",
+        "ip": "192.168.0.101",
+        "port": 2000,
+        "driver": "microbot",
+        "ros_namespace": None,
+        "baud_rate": None,
+        "shared": False,
+        "active": False,
+    },
 ]
 
 _USERS_TEMPLATE = {
